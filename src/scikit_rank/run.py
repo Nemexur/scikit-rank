@@ -102,11 +102,84 @@ class RunOutput:
 
 
 class TrainingRun:
-    """Training command.
+    """Configure and execute one model-training run.
 
-    Construction wires the Accelerator, optimizer, prepared model + loss,
-    loaders, trainer and handlers; :meth:`run` executes the fit and returns
-    a :class:`RunOutput`.
+    ``TrainingRun`` is the orchestration layer between a model/loss pair and
+    :class:`~scikit_rank.train.trainer.Trainer`. Construction prepares the
+    model, loss, optimizer, data loaders, Accelerate runtime, and optional
+    training handlers. It does not start training; call :meth:`run` exactly
+    when the configuration is ready to execute.
+
+    The training and validation sources must yield dictionaries of tensors.
+    A batch normally contains ``num`` and ``cat`` feature tensors, plus
+    ``target``; ranking losses may also require a ``group`` tensor. The same
+    batch contract is used by :class:`TrainingModule` for training,
+    evaluation, and inference.
+
+    Parameters
+    ----------
+    model : torch.nn.Module
+        Network that accepts a batch dictionary and returns a tensor of
+        logits. The model may expose ``embedding_parameters()`` when
+        ``embedding_regularizer`` is enabled.
+    loss_fn : Loss
+        Loss module used by ``model``. Group-aware losses require each
+        training batch to contain a ``group`` tensor.
+    train_source : iterable of dict[str, torch.Tensor]
+        Training batches. Each item is passed to a ``DataLoader``. Use a
+        source that already respects group boundaries for ranking tasks.
+    val_source : iterable of dict[str, torch.Tensor] or None, default=None
+        Optional validation batches. Validation enables metric tracking,
+        best-state restoration, early stopping, and validation-based learning
+        rate scheduling.
+    lr : float
+        Learning rate. This value overrides the learning rate in ``optimizer``.
+    weight_decay : float
+        L2 weight-decay coefficient. This value overrides the value in
+        ``optimizer``.
+    epochs : int
+        Maximum number of epochs to execute.
+    optimizer : OptimizerConfig or None, default=None
+        Optimizer configuration. If omitted, the default ``OptimizerConfig``
+        is used.
+    early_stopping_rounds : int or None, default=None
+        Number of validation epochs without improvement before stopping.
+        Requires ``val_source``.
+    verbose : bool, default=False
+        Whether to display the progress bar and epoch logs on the main process.
+    accelerator_config : dict[str, Any] or None, default=None
+        Keyword arguments passed to :class:`accelerate.Accelerator`, such as
+        ``{"cpu": True}`` or a mixed-precision configuration.
+    eval_metric_fn : callable or None, default=None
+        Optional validation metric with signature
+        ``metric(y_true, y_pred[, group]) -> float``. When omitted, validation
+        loss is monitored instead.
+    eval_metric_name : str, default="metric"
+        Name stored in validation metrics and training history.
+    eval_metric_direction : {"max", "min"}, default="max"
+        Whether a larger or smaller validation metric is better. Ignored when
+        ``eval_metric_fn`` is omitted, because loss is always minimized.
+    eval_metric_group_aware : bool, default=False
+        Pass validation group ids as the third argument to ``eval_metric_fn``.
+    lr_scheduler : LRSchedulerConfig or None, default=None
+        Optional learning-rate scheduler configuration. With a validation
+        source, scheduling is driven by the monitored validation metric.
+    grad_clip_norm : float or None, default=None
+        Maximum global gradient norm. ``None`` disables gradient clipping.
+    embedding_regularizer : float, default=0.0
+        Coefficient of the embedding L2 penalty added to the training loss.
+    ema_decay : float or None, default=None
+        Decay for an exponential moving average of model weights. The best
+        EMA weights are restored when validation is available; otherwise the
+        final EMA weights are used. Do not combine this with
+        ``schedulefree_adamw``.
+
+    Notes
+    -----
+    The Accelerator, prepared model, optimizer, and loaders are created during
+    construction. Construct a new ``TrainingRun`` for a new training session;
+    a completed run is not intended to be restarted.
+
     """
 
     def __init__(
