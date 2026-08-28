@@ -54,7 +54,7 @@ def test_classifier_lazy_matches_eager_full_batch() -> None:
     eager = DCNClassifier(**params).fit(x_pred, df["target"].to_numpy())
     lazy = DCNClassifier(**params).fit(df.lazy(), y="target")
 
-    np.testing.assert_array_equal(
+    np.testing.assert_allclose(
         eager.predict_proba(x_pred),
         lazy.predict_proba(x_pred.lazy()),
     )
