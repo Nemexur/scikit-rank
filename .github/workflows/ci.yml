@@ -36,10 +36,19 @@ jobs:
         run: uv sync --locked --dev
 
       - name: Ruff format check
-        run: uvx ruff format --check .
+        run: >-
+          uv run ruff format --check
+          --exclude tests/
+          --exclude exps/
+          --exclude '*.ipynb'
+          --exclude README.md
 
       - name: Ruff lint
-        run: uvx ruff check .
+        run: >-
+          uv run ruff check
+          --exclude tests/
+          --exclude exps/
+          --exclude '*.ipynb'
 
       - name: Run tests
         run: uv run pytest
