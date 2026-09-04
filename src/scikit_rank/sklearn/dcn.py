@@ -23,19 +23,19 @@ from typing import TYPE_CHECKING, Any, Literal
 import numpy as np
 import polars as pl
 import torch
-from scipy.special import expit, softmax
+from scipy.special import expit
 from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
-from sklearn.preprocessing import LabelEncoder
-from sklearn.utils.multiclass import check_classification_targets
 from sklearn.utils.validation import check_is_fitted
 
-from scikit_rank.data import to_numpy_1d, to_polars
+from scikit_rank.data import to_polars
 from scikit_rank.factories import build_dcnv2, build_lr_scheduler_config, multihash_encoder_config
 from scikit_rank.modules.dcn import CoralLayer
 from scikit_rank.modules.losses import LOSSES, CORALLayerLoss, Loss, make_loss
 from scikit_rank.preprocessing import TabularPreprocessor
 from scikit_rank.run import TrainingRun
+from scikit_rank.sklearn._classification import ClassificationTarget, class_probabilities
 from scikit_rank.sklearn._data_router import DataRouter
+from scikit_rank.sklearn._inference import score_tabular_model
 from scikit_rank.sklearn._input_validation import validate_X, validate_y
 from scikit_rank.train.optimizers import OptimizerConfig
 from scikit_rank.utils import ModuleParserSpec
@@ -576,15 +576,6 @@ class DCNBase(BaseEstimator):
             raise TypeError(f"Expected saved {cls.__name__}, got {type(obj).__name__}")
         return obj
 
-    def _inference_device(self) -> torch.device:
-        if self.accelerator_config and self.accelerator_config.get("cpu"):
-            return torch.device("cpu")
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        if torch.backends.mps.is_available():
-            return torch.device("mps")
-        return torch.device("cpu")
-
     def _decision_scores(self, X: XLike) -> np.ndarray:
         check_is_fitted(self, "model_")
         if not isinstance(X, pl.LazyFrame):
@@ -593,39 +584,14 @@ class DCNBase(BaseEstimator):
                 expected_features=self.n_features_in_,
                 estimator_name=type(self).__name__,
             )
-        frame = to_polars(X)
-        device = self._inference_device()
-        self.model_.to(device).eval()
-        try:
-            if isinstance(frame, pl.LazyFrame):
-                n_rows = frame.select(pl.len()).collect().item()
-                chunks = [
-                    self._score_frame(
-                        frame.slice(start, self.chunk_rows).collect(),
-                        device,
-                    )
-                    for start in range(0, n_rows, self.chunk_rows)
-                ]
-                return np.concatenate(chunks, axis=0)
-            return self._score_frame(frame, device)
-        finally:
-            self.model_.cpu()
-
-    @torch.no_grad()
-    def _score_frame(self, df: pl.DataFrame, device: torch.device) -> np.ndarray:
-        num, cat, extra = self.preprocessor_.transform(df)
-        outputs = []
-        for start in range(0, len(num), self.batch_size):
-            stop = start + self.batch_size
-            batch = {
-                "num": torch.from_numpy(num[start:stop]).to(device),
-                "cat": torch.from_numpy(cat[start:stop]).to(device),
-            }
-            batch.update(
-                {name: torch.from_numpy(arr[start:stop]).to(device) for name, arr in extra.items()},
-            )
-            outputs.append(self.model_(batch).float().cpu().numpy())
-        return np.concatenate(outputs, axis=0) if outputs else np.zeros((0,), dtype=np.float32)
+        return score_tabular_model(
+            model=self.model_,
+            preprocessor=self.preprocessor_,
+            frame=to_polars(X),
+            batch_size=self.batch_size,
+            chunk_rows=self.chunk_rows,
+            accelerator_config=self.accelerator_config,
+        )
 
 
 class DCNClassifier(ClassifierMixin, DCNBase):
@@ -666,23 +632,10 @@ class DCNClassifier(ClassifierMixin, DCNBase):
         y: YLike,
         target_col: str | None,
     ) -> None:
-        if target_col is not None:
-            values = (
-                frame.lazy()
-                .select(pl.col(target_col).unique().sort())
-                .collect()
-                .to_series()
-                .to_numpy()
-            )
-        else:
-            y_arr = to_numpy_1d(y)
-            # Reject regression-style continuous targets up-front so the error
-            # matches sklearn's expected wording (check_classifiers_regression_target).
-            check_classification_targets(y_arr)
-            values = np.unique(y_arr)
-        self._label_encoder_ = LabelEncoder().fit(values)
-        self.classes_ = self._label_encoder_.classes_
-        self.n_classes_ = len(self.classes_)
+        self._classification_target_ = ClassificationTarget.fit(frame, y, target_col)
+        self._label_encoder_ = self._classification_target_.label_encoder
+        self.classes_ = self._classification_target_.classes
+        self.n_classes_ = self._classification_target_.n_classes
 
     def _resolve_n_outputs(self) -> int:
         return 1 if self.n_classes_ <= 2 else self.n_classes_
@@ -720,18 +673,10 @@ class DCNClassifier(ClassifierMixin, DCNBase):
         return super().fit(X, y=y, group=group, eval_set=eval_set)
 
     def _prepare_y(self, y: np.ndarray) -> np.ndarray:
-        return self._label_encoder_.transform(y).astype(np.float32)
+        return self._classification_target_.encode(y)
 
     def _y_expr(self, target_col: str) -> pl.Expr:
-        # build mapping keys through polars' own String cast so the string
-        # rendering matches the casted column exactly (e.g. bools: "true")
-        classes = pl.Series(self.classes_).cast(pl.String).to_list()
-        codes = [float(i) for i in range(self.n_classes_)]
-        return (
-            pl.col(target_col)
-            .cast(pl.String)
-            .replace_strict(classes, codes, default=None, return_dtype=pl.Float32)
-        )
+        return self._classification_target_.expression(target_col)
 
     def predict_proba(self, X: XLike) -> np.ndarray:
         """Predict class probabilities for ``X``.
@@ -749,10 +694,7 @@ class DCNClassifier(ClassifierMixin, DCNBase):
 
         """
         scores = self._decision_scores(X)
-        if scores.ndim == 1:  # binary, single logit
-            p1 = expit(scores)
-            return np.stack([1.0 - p1, p1], axis=1)
-        if isinstance(self.model_.head(), CoralLayer):
+        if isinstance(self.model_.head(), CoralLayer) and scores.ndim > 1:
             # CORAL logits are cumulative P(Y >= k), k=1..K-1. Convert to
             # mutually-exclusive class probabilities and enforce monotonicity
             # defensively in case learned raw biases cross.
@@ -765,7 +707,7 @@ class DCNClassifier(ClassifierMixin, DCNBase):
                 ],
                 axis=1,
             )
-        return softmax(scores, axis=1)
+        return class_probabilities(scores)
 
     def predict(self, X: XLike) -> np.ndarray:
         """Predict class labels for ``X``.

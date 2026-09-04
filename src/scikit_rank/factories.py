@@ -32,6 +32,7 @@ from scikit_rank.modules.dcn import (
     StackedCrossDeep,
     UnifiedEmbeddings,
 )
+from scikit_rank.modules.finalnet import FinalBlock, FinalNet
 from scikit_rank.modules.reducers import Concat
 from scikit_rank.train.optimizers import LRSchedulerConfig
 from scikit_rank.utils import ModuleParserSpec
@@ -423,6 +424,118 @@ def build_dcnv2(
     )
 
     model = DCNv2(layers=layers, reducer=reducer, body=body, head=head)
+    _init_weights(model)
+    return model
+
+
+def build_finalnet(
+    *,
+    n_num_features: int,
+    cardinalities: Sequence[int],
+    embedding_dims: Sequence[int] | None = None,
+    block_type: str = "2B",
+    block1_hidden_units: Sequence[int] = (400, 400),
+    block2_hidden_units: Sequence[int] | None = None,
+    block1_hidden_activations: str | Sequence[str | None] | None = None,
+    block2_hidden_activations: str | Sequence[str | None] | None = None,
+    block1_dropout: float | Sequence[float] = 0.0,
+    block2_dropout: float | Sequence[float] | None = None,
+    batch_norm: bool = True,
+    residual_type: str = "concat",
+    interaction_activation: str | None = "relu",
+    num_encoder: str | torch.nn.Module = "identity",
+    cat_encoder: str | torch.nn.Module = "per_feature",
+    reducer: torch.nn.Module | None = None,
+    n_outputs: int = 1,
+    num_encoder_bins: list[torch.Tensor] | None = None,
+    multihash_encoder: str | torch.nn.Module = "multihash",
+    multihash_n_inputs: int | None = None,
+    embedding_encoders: dict[str, str | torch.nn.Module] | None = None,
+    embedding_input_dims: dict[str, int] | None = None,
+    extra_layers: dict[str, torch.nn.Module] | None = None,
+) -> FinalNet:
+    """Compose a FINAL model from feature specs and block hyperparameters."""
+    if block_type not in ("1B", "2B"):
+        raise ValueError("block_type must be '1B' or '2B'")
+
+    layers: dict[str, torch.nn.Module] = {}
+    if n_num_features > 0:
+        layers["num"] = build_numeric_encoder(
+            num_encoder,
+            n_features=n_num_features,
+            bins=num_encoder_bins,
+        )
+    if (
+        cat := build_categorical_encoder(
+            cat_encoder,
+            cardinalities=cardinalities,
+            embedding_dims=embedding_dims,
+        )
+    ) is not None:
+        layers["cat"] = cat
+    reference_layers = _build_reference_layers(
+        multihash_encoder=multihash_encoder,
+        multihash_n_inputs=multihash_n_inputs,
+        embedding_encoders=embedding_encoders,
+        embedding_input_dims=embedding_input_dims,
+    )
+    overlap = set(layers).intersection(reference_layers)
+    if overlap:
+        raise ValueError(f"reference streams duplicate built-in streams: {sorted(overlap)}")
+    layers.update(reference_layers)
+    if extra_layers:
+        overlap = set(layers).intersection(extra_layers)
+        if overlap:
+            raise ValueError(f"extra_layers duplicate built-in streams: {sorted(overlap)}")
+        for name, module in extra_layers.items():
+            _require_output_dim(module, f"extra layer {name!r}")
+            layers[name] = copy.deepcopy(module)
+    if not layers:
+        raise ValueError("FinalNet needs at least one input stream.")
+
+    reducer = reducer if reducer is not None else Concat(dim=-1)
+    if not hasattr(reducer, "compute_output_dim"):
+        raise TypeError("reducer must expose compute_output_dim(input_dims) -> int")
+    representation_dim = reducer.compute_output_dim(
+        {name: m.output_dim() for name, m in layers.items()},
+    )
+
+    first_units = list(block1_hidden_units)
+    first_block = FinalBlock(
+        representation_dim,
+        first_units,
+        hidden_activations=block1_hidden_activations,
+        dropout=block1_dropout,
+        batch_norm=batch_norm,
+        residual_type=residual_type,
+        interaction_activation=interaction_activation,
+    )
+    first_head = torch.nn.Linear(first_block.output_dim(), n_outputs)
+    if block_type == "1B":
+        model = FinalNet(layers=layers, reducer=reducer, block1=first_block, head1=first_head)
+    else:
+        second_units = list(block2_hidden_units or block1_hidden_units)
+        second_block = FinalBlock(
+            representation_dim,
+            second_units,
+            hidden_activations=(
+                block1_hidden_activations
+                if block2_hidden_activations is None
+                else block2_hidden_activations
+            ),
+            dropout=block1_dropout if block2_dropout is None else block2_dropout,
+            batch_norm=batch_norm,
+            residual_type=residual_type,
+            interaction_activation=interaction_activation,
+        )
+        model = FinalNet(
+            layers=layers,
+            reducer=reducer,
+            block1=first_block,
+            head1=first_head,
+            block2=second_block,
+            head2=torch.nn.Linear(second_block.output_dim(), n_outputs),
+        )
     _init_weights(model)
     return model
 
