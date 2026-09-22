@@ -1,6 +1,10 @@
 """Neural network building blocks for scikit_rank.
 
 * :mod:`scikit_rank.modules.dcn`      - DCNv2 model components and composition root.
+* :mod:`scikit_rank.modules.destine`  - DESTINE field-wise disentangled attention.
+* :mod:`scikit_rank.modules.finalnet` - FINAL model components and composition root.
 * :mod:`scikit_rank.modules.losses`   - Loss strategy classes and registry.
 * :mod:`scikit_rank.modules.reducers` - Reducer modules for fusing encoder streams.
+* :mod:`scikit_rank.modules.final_mlp` - FinalMLP feature gating and bilinear fusion.
+* :mod:`scikit_rank.modules.tabm`      - TabM ensemble composition.
 """

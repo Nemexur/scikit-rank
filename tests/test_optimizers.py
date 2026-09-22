@@ -40,6 +40,7 @@ def _frame(n: int = 200):
 
 def test_optimizer_types_registry_is_complete():
     assert set(OPTIMIZER_TYPES) == {
+        "adam",
         "adamw",
         "adamw_amsgrad",
         "muon",

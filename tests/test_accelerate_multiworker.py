@@ -120,10 +120,6 @@ def _run_training(script: Path, output: Path, world_size: int) -> dict:
     return json.loads(output.read_text(encoding="utf-8"))
 
 
-@pytest.mark.skipif(
-    sys.platform == "darwin",
-    reason="torch 2.12 CPU DDP segfaults in DistributedDataParallel.__init__ on macOS",
-)
 def test_accelerate_two_worker_training_matches_single_worker(tmp_path: Path) -> None:
     script = tmp_path / "train_with_accelerate.py"
     script.write_text(_TRAIN_SCRIPT, encoding="utf-8")

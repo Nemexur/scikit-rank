@@ -39,6 +39,10 @@ from scikit_rank.train.trainer import ModelEvents, Trainer
 class TrainingModule(torch.nn.Module):
     """Adapt a (model, loss) pair to the Trainer's batch-dict contract.
 
+    Models may return either logits directly or ``(logits, *extras)``. The
+    primary logits are exposed to the trainer and extras are forwarded to the
+    loss for model-specific objectives.
+
     ``forward(batch)`` returns ``{"logits"[, "loss"]}``; the loss is computed
     only when the batch carries a target, so the same module serves training,
     evaluation and inference.
@@ -56,7 +60,8 @@ class TrainingModule(torch.nn.Module):
         return self._loss_fn
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        logits = self._model(batch)
+        model_output = self._model(batch)
+        logits, *extras = model_output if isinstance(model_output, tuple) else (model_output,)
         output: dict[str, torch.Tensor] = {"logits": logits}
         if batch.get("target") is not None:
             target = batch["target"]
@@ -77,7 +82,7 @@ class TrainingModule(torch.nn.Module):
                     "does not contain group ids. Pass group=... to fit() or "
                     "choose a pointwise loss.",
                 )
-            output["loss"] = self._loss_fn(logits, target, group)
+            output["loss"] = self._loss_fn(logits, target, group, extras=tuple(extras))
         return output
 
 

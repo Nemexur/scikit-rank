@@ -1,7 +1,7 @@
 """Ranking/classification/regression losses.
 
 Every loss is a ``torch.nn.Module`` with the uniform signature
-``forward(scores, target, group=None)``:
+``forward(scores, target, group=None, **kwargs)``:
 
 * ``scores`` — model logits, shape ``[B]`` (or ``[B, K]`` for multiclass /
   CORAL-layer heads),
@@ -9,6 +9,8 @@ Every loss is a ``torch.nn.Module`` with the uniform signature
   treat any ``target > 0`` as positive,
 * ``group`` — per-row query id for pairwise/listwise losses. Batches are
   group-contiguous, so these losses always see whole groups.
+* ``extras`` — optional model-specific tensors following the primary logits;
+  standard losses ignore them and paired model losses consume them.
 
 Families: pointwise, pairwise, listwise, ordinal, and convex combinations.
 """
@@ -68,6 +70,7 @@ class Loss(ABC, torch.nn.Module):
         scores: torch.Tensor,
         target: torch.Tensor,
         group: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor: ...
 
 
@@ -267,6 +270,7 @@ class BCELoss(Loss):
         scores: torch.Tensor,
         target: torch.Tensor,
         group: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         if (zero_loss := _zero_loss_if_empty(scores)) is not None:
             return zero_loss
@@ -293,6 +297,7 @@ class FocalLoss(Loss):
         scores: torch.Tensor,
         target: torch.Tensor,
         group: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         if (zero_loss := _zero_loss_if_empty(scores)) is not None:
             return zero_loss
@@ -328,6 +333,7 @@ class LabelSmoothingBCELoss(Loss):
         scores: torch.Tensor,
         target: torch.Tensor,
         group: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         if (zero_loss := _zero_loss_if_empty(scores)) is not None:
             return zero_loss
@@ -344,6 +350,7 @@ class CrossEntropyLoss(Loss):
         scores: torch.Tensor,
         target: torch.Tensor,
         group: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         if (zero_loss := _zero_loss_if_empty(scores)) is not None:
             return zero_loss
@@ -358,6 +365,7 @@ class MSELoss(Loss):
         scores: torch.Tensor,
         target: torch.Tensor,
         group: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         if (zero_loss := _zero_loss_if_empty(scores)) is not None:
             return zero_loss
@@ -372,6 +380,7 @@ class MAELoss(Loss):
         scores: torch.Tensor,
         target: torch.Tensor,
         group: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         if (zero_loss := _zero_loss_if_empty(scores)) is not None:
             return zero_loss
@@ -402,6 +411,7 @@ class QuantileRegressionLoss(Loss):
         scores: torch.Tensor,
         target: torch.Tensor,
         group: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         if (zero_loss := _zero_loss_if_empty(scores)) is not None:
             return zero_loss
@@ -432,6 +442,7 @@ class SoftOrdinalBCELoss(Loss):
         scores: torch.Tensor,
         target: torch.Tensor,
         group: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         if (zero_loss := _zero_loss_if_empty(scores)) is not None:
             return zero_loss
@@ -457,6 +468,7 @@ class DistillBCELoss(Loss):
         target: torch.Tensor,
         group: torch.Tensor | None = None,
         teacher_scores: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         if (zero_loss := _zero_loss_if_empty(scores)) is not None:
             return zero_loss
@@ -492,6 +504,7 @@ class PairwiseMarginLoss(Loss):
         scores: torch.Tensor,
         target: torch.Tensor,
         group: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         pairwise_out = _pairwise_tensors(scores, target, group)
         if not pairwise_out.pos_pairs.any():
@@ -527,6 +540,7 @@ class BPRLoss(Loss):
         scores: torch.Tensor,
         target: torch.Tensor,
         group: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         pairwise_out = _pairwise_tensors(scores, target, group)
         if not pairwise_out.pos_pairs.any():
@@ -561,6 +575,7 @@ class LambdaRankLoss(Loss):
         scores: torch.Tensor,
         target: torch.Tensor,
         group: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         pairwise_out = _pairwise_tensors(scores, target, group)
         if not pairwise_out.pos_pairs.any():
@@ -613,6 +628,7 @@ class FocalLambdaRankLoss(Loss):
         scores: torch.Tensor,
         target: torch.Tensor,
         group: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         pairwise_out = _pairwise_tensors(scores, target, group)
         if not pairwise_out.pos_pairs.any():
@@ -671,6 +687,7 @@ class LambdaNDCG2PPLoss(Loss):
         scores: torch.Tensor,
         target: torch.Tensor,
         group: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         pairwise_out = _pairwise_tensors(scores, target, group)
         if not pairwise_out.pos_pairs.any():
@@ -730,6 +747,7 @@ class ListwiseSoftmaxLoss(Loss):
         scores: torch.Tensor,
         target: torch.Tensor,
         group: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         grouped_out = _grouped_1d(scores, target, group)
         if grouped_out.scores.numel() == 0:
@@ -784,6 +802,7 @@ class ApproxNDCGLoss(Loss):
         scores: torch.Tensor,
         target: torch.Tensor,
         group: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         padded_out = _pad_by_group(scores, target, group)
         if padded_out.scores.numel() == 0:
@@ -839,6 +858,7 @@ class ListMLELoss(Loss):
         scores: torch.Tensor,
         target: torch.Tensor,
         group: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         padded_out = _pad_by_group(scores, target, group)
         valid_group = (padded_out.lengths >= 2) & (padded_out.target.sum(dim=1) > 0)
@@ -894,6 +914,7 @@ class NeuralNDCGLoss(Loss):
         scores: torch.Tensor,
         target: torch.Tensor,
         group: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         padded_out = _pad_by_group(scores, target, group)
         valid_group = (padded_out.lengths >= 2) & (padded_out.target.sum(dim=1) > 0)
@@ -1003,6 +1024,7 @@ class CORALOrdinalLoss(Loss):
         scores: torch.Tensor,
         target: torch.Tensor,
         group: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         device = scores.device
         levels = torch.arange(1, self._num_classes, device=device).float()
@@ -1030,6 +1052,7 @@ class CORNLoss(Loss):
         scores: torch.Tensor,
         target: torch.Tensor,
         group: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         losses_weighted = []
         total_n = 0
@@ -1075,6 +1098,7 @@ class BinomialOrdinalLoss(Loss):
         scores: torch.Tensor,
         target: torch.Tensor,
         group: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         log_p = F.logsigmoid(scores)  # [B]
         log_1mp = F.logsigmoid(-scores)  # [B]
@@ -1123,6 +1147,7 @@ class SoftLabelCORALoss(Loss):
         scores: torch.Tensor,
         target: torch.Tensor,
         group: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         device = scores.device
         levels = torch.arange(1, self._num_classes, device=device).float()
@@ -1157,6 +1182,7 @@ class WeightedCORALoss(Loss):
         scores: torch.Tensor,
         target: torch.Tensor,
         group: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         device = scores.device
         target = target.float()
@@ -1199,6 +1225,7 @@ class CORALRawBiasLoss(Loss):
         scores: torch.Tensor,
         target: torch.Tensor,
         group: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         device = scores.device
         levels = torch.arange(1, self._num_classes, device=device).float()
@@ -1233,6 +1260,7 @@ class SoftLabelCORALRawBiasLoss(Loss):
         scores: torch.Tensor,
         target: torch.Tensor,
         group: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         device = scores.device
         levels = torch.arange(1, self._num_classes, device=device).float()
@@ -1254,6 +1282,7 @@ class CORALLayerLoss(Loss):
         scores: torch.Tensor,
         target: torch.Tensor,
         group: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         if scores.dim() != 2:
             raise ValueError(
@@ -1297,6 +1326,7 @@ class CombinedLoss(Loss):
         scores: torch.Tensor,
         target: torch.Tensor,
         group: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         l1 = self._loss1(scores, target, group)
         l2 = self._loss2(scores, target, group)
@@ -1319,6 +1349,7 @@ class BCEV2LambdaRankCombined(Loss):
         scores: torch.Tensor,
         target: torch.Tensor,
         group: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         return (1 - self._alpha) * self._bce(
             scores,
@@ -1341,6 +1372,7 @@ class WBCE2CoralCombinedLoss(Loss):
         scores: torch.Tensor,
         target: torch.Tensor,
         group: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         return (1 - self._alpha) * self._bce(
             scores,
@@ -1363,6 +1395,7 @@ class WBCECORNLoss(Loss):
         scores: torch.Tensor,
         target: torch.Tensor,
         group: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         return (1 - self._alpha) * self._bce(
             scores,
@@ -1392,6 +1425,7 @@ class CoralLambdaRankLoss(Loss):
         scores: torch.Tensor,
         target: torch.Tensor,
         group: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         return (1 - self._alpha) * self._coral(
             scores,

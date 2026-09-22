@@ -1,4 +1,4 @@
-"""sklearn-compatible estimators: DCNClassifier, DCNRegressor, DCNRanker.
+"""sklearn-compatible estimators: FinalNetClassifier, FinalNetRegressor, FinalNetRanker.
 
 API follows the LightGBM/XGBoost sklearn wrappers: flat ``__init__``
 hyperparameters (sklearn ``get_params``/``set_params``/``clone`` work out of
@@ -23,19 +23,22 @@ from typing import TYPE_CHECKING, Any, Literal
 import numpy as np
 import polars as pl
 import torch
-from scipy.special import expit, softmax
 from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
-from sklearn.preprocessing import LabelEncoder
-from sklearn.utils.multiclass import check_classification_targets
 from sklearn.utils.validation import check_is_fitted
 
-from scikit_rank.data import to_numpy_1d, to_polars
-from scikit_rank.factories import build_dcnv2, build_lr_scheduler_config, multihash_encoder_config
-from scikit_rank.modules.dcn import CoralLayer
-from scikit_rank.modules.losses import LOSSES, CORALLayerLoss, Loss, make_loss
+from scikit_rank.data import to_polars
+from scikit_rank.factories import (
+    build_finalnet,
+    build_lr_scheduler_config,
+    multihash_encoder_config,
+)
+from scikit_rank.modules.finalnet import FinalNetConsistencyLoss
+from scikit_rank.modules.losses import LOSSES, BCELoss, CORALLayerLoss, Loss, make_loss
 from scikit_rank.preprocessing import TabularPreprocessor
 from scikit_rank.run import TrainingRun
+from scikit_rank.sklearn._classification import ClassificationTarget, class_probabilities
 from scikit_rank.sklearn._data_router import DataRouter
+from scikit_rank.sklearn._inference import score_tabular_model
 from scikit_rank.sklearn._input_validation import validate_X, validate_y
 from scikit_rank.train.optimizers import OptimizerConfig
 from scikit_rank.utils import ModuleParserSpec
@@ -48,11 +51,12 @@ if TYPE_CHECKING:
     from scikit_rank.sklearn._types import EvalSet, GroupLike, XLike, YLike
 
 
-class DCNBase(BaseEstimator):
-    """Shared fit/predict machinery for the DCNv2 estimators.
+class FinalNetBase(BaseEstimator):
+    """Shared fit/predict machinery for the FinalNet estimators.
 
-    Not used directly -- instantiate :class:`DCNClassifier`, :class:`DCNRegressor`,
-    or :class:`DCNRanker`. This base holds every hyperparameter and the common
+    Not used directly -- instantiate :class:`FinalNetClassifier`,
+    :class:`FinalNetRegressor`, or :class:`FinalNetRanker`. This base holds every
+    hyperparameter and the common
     training/inference loop; the subclasses only add task-specific target handling
     and prediction. All estimators follow the LightGBM/XGBoost sklearn-wrapper
     convention: every hyperparameter is an explicit ``__init__`` keyword, so
@@ -61,45 +65,42 @@ class DCNBase(BaseEstimator):
 
     Parameters
     ----------
-    hidden_units : list[int], default=(256, 128)
-        Layer widths of the deep (MLP) branch.
-    cross_layers : int, default=3
-        Number of DCNv2 feature-crossing layers.
-    cross_rank : int or None, default=None
-        Rank of the low-rank factorization of each cross weight matrix. ``None``
-        uses the full-rank cross weights.
+    block_type : {"1B", "2B"}, default="2B"
+        Use one factorized-interaction block or two parallel blocks whose
+        logits are averaged.
+    block1_hidden_units : sequence of int, default=(400, 400)
+        Output widths of the first factorized-interaction block.
+    block2_hidden_units : sequence of int or None, default=None
+        Output widths of the second block. ``None`` reuses
+        ``block1_hidden_units``.
+    block1_hidden_activations, block2_hidden_activations : str, sequence, or None
+        Activations applied after batch normalization in each block.
+    block1_dropout, block2_dropout : float or sequence of float
+        Per-layer dropout rates. The second block reuses the first block's
+        rates when ``block2_dropout=None``.
+    batch_norm : bool, default=True
+        Apply batch normalization after each factorized interaction.
+    residual_type : {"sum", "concat"}, default="concat"
+        Composition used inside each factorized-interaction layer.
+    interaction_activation : str or None, default="relu"
+        Activation applied to both halves of the interaction projection.
+        Set to ``None`` for the original FuxiCTR FinalNet behavior.
+    use_field_gate : bool, default=False
+        Apply the FinalNet reference field gate to the first block. All logical
+        feature fields must have the same encoded width.
+    use_2b_consistency_loss : bool, default=False
+        Add the reference two-branch consistency/self-distillation objective.
+        This is supported only by binary :class:`FinalNetClassifier` with
+        ``block_type="2B"`` and BCE loss.
     embedding_dim : int or None, default=None
         Embedding size for every categorical feature. ``None`` picks a per-column
         size with the fast.ai heuristic ``min(32, max(2, round(1.6 * card**0.56)))``.
-    dropout : float, default=0.0
-        Dropout probability applied in the deep branch.
-    structure : {"stacked", "parallel"}, default="stacked"
-        How the cross and deep branches are composed. ``"stacked"`` feeds the
-        cross output into the deep branch; ``"parallel"`` concatenates them.
     num_encoder : str or torch.nn.Module, default="identity"
         Numeric-feature encoder spec, e.g. ``"identity"`` or ``"ple"`` (piecewise
         linear encoding, whose bins are fit from training quantiles). A custom
         ``Module`` is used as-is.
     cat_encoder : str or torch.nn.Module, default="per_feature"
         Categorical-feature encoder spec (e.g. one embedding table per feature).
-    gated_cross : bool, default=False
-        Enable the gated variant of the cross layers.
-    cross_type : str, default="standard"
-        Cross-layer variant selector.
-    mask_ratio : float, default=0.5
-        Masking ratio used by mask-enabled cross variants.
-    activation : str, default="relu"
-        Activation function name for the deep branch.
-    batch_norm : bool, default=False
-        Apply batch normalization in the deep branch.
-    use_moe : bool, default=False
-        Replace the deep branch with a mixture-of-experts block.
-    num_experts : int, default=4
-        Number of experts when ``use_moe=True``.
-    moe_top_k : int, default=2
-        Number of experts routed per row when ``use_moe=True``.
-    use_inner_cross_layers : bool, default=False
-        Enable the inner cross-layer variant.
     loss : str or Loss or None, default=None
         Loss spec string (e.g. ``"bce"``, ``"bpr:sampling=all_pairs"``,
         ``"lambdarank"``, ``"cross_entropy"``, ``"coral_layer"``) or a :class:`Loss`
@@ -178,7 +179,7 @@ class DCNBase(BaseEstimator):
     Attributes
     ----------
     model_ : torch.nn.Module
-        The fitted DCNv2 network (kept on CPU for stable pickling).
+        The fitted FinalNet network (kept on CPU for stable pickling).
     loss_ : Loss
         The instantiated loss module.
     history_ : list[dict[str, float]]
@@ -194,27 +195,26 @@ class DCNBase(BaseEstimator):
     """
 
     _default_loss = "bce"
+    _supports_2b_consistency_loss = False
 
-    def __init__(  # noqa: PLR0913 -- sklearn estimator: every hyperparam is an explicit kwarg
+    def __init__(  # noqa: PLR0913 -- sklearn estimator: every hyperparam is explicit
         self,
         *,
-        hidden_units: list[int] | tuple[int, ...] = (256, 128),
-        cross_layers: int = 3,
-        cross_rank: int | None = None,
+        block_type: Literal["1B", "2B"] = "2B",
+        block1_hidden_units: list[int] | tuple[int, ...] = (400, 400),
+        block2_hidden_units: list[int] | tuple[int, ...] | None = None,
+        block1_hidden_activations: str | Sequence[str | None] | None = None,
+        block2_hidden_activations: str | Sequence[str | None] | None = None,
+        block1_dropout: float | Sequence[float] = 0.0,
+        block2_dropout: float | Sequence[float] | None = None,
+        batch_norm: bool = True,
+        residual_type: Literal["sum", "concat"] = "concat",
+        interaction_activation: str | None = "relu",
+        use_field_gate: bool = False,
+        use_2b_consistency_loss: bool = False,
         embedding_dim: int | None = None,
-        dropout: float = 0.0,
-        structure: Literal["stacked", "parallel"] = "stacked",
         num_encoder: str | torch.nn.Module = "identity",
         cat_encoder: str | torch.nn.Module = "per_feature",
-        gated_cross: bool = False,
-        cross_type: str = "standard",
-        mask_ratio: float = 0.5,
-        activation: str = "relu",
-        batch_norm: bool = False,
-        use_moe: bool = False,
-        num_experts: int = 4,
-        moe_top_k: int = 2,
-        use_inner_cross_layers: bool = False,
         loss: str | Loss | None = None,
         lr: float = 1e-3,
         weight_decay: float = 0.0,
@@ -246,22 +246,20 @@ class DCNBase(BaseEstimator):
         accelerator_config: dict[str, Any] | None = None,
         verbose: bool = False,
     ) -> None:
-        self.hidden_units = hidden_units
-        self.cross_layers = cross_layers
-        self.cross_rank = cross_rank
-        self.embedding_dim = embedding_dim
-        self.dropout = dropout
-        self.structure = structure
-        self.num_encoder = num_encoder
-        self.gated_cross = gated_cross
-        self.cross_type = cross_type
-        self.mask_ratio = mask_ratio
-        self.activation = activation
+        self.block_type = block_type
+        self.block1_hidden_units = block1_hidden_units
+        self.block2_hidden_units = block2_hidden_units
+        self.block1_hidden_activations = block1_hidden_activations
+        self.block2_hidden_activations = block2_hidden_activations
+        self.block1_dropout = block1_dropout
+        self.block2_dropout = block2_dropout
         self.batch_norm = batch_norm
-        self.use_moe = use_moe
-        self.num_experts = num_experts
-        self.moe_top_k = moe_top_k
-        self.use_inner_cross_layers = use_inner_cross_layers
+        self.residual_type = residual_type
+        self.interaction_activation = interaction_activation
+        self.use_field_gate = use_field_gate
+        self.use_2b_consistency_loss = use_2b_consistency_loss
+        self.embedding_dim = embedding_dim
+        self.num_encoder = num_encoder
         self.cat_encoder = cat_encoder
         self.loss = loss
         self.lr = lr
@@ -325,6 +323,18 @@ class DCNBase(BaseEstimator):
             loss_fn = make_loss(loss_spec.module_name(), **loss_spec.kwargs())
         return loss_fn
 
+    def _validate_2b_consistency_loss(self, loss_fn: Loss, n_outputs: int) -> None:
+        if not self.use_2b_consistency_loss:
+            return
+        if self.block_type != "2B":
+            raise ValueError("use_2b_consistency_loss=True requires block_type='2B'")
+        if not self._supports_2b_consistency_loss or n_outputs != 1:
+            raise TypeError(
+                "use_2b_consistency_loss=True is supported only for binary FinalNetClassifier",
+            )
+        if not isinstance(loss_fn, BCELoss):
+            raise TypeError("use_2b_consistency_loss=True requires loss='bce'")
+
     def _fit_target_meta(
         self,
         frame: pl.DataFrame | pl.LazyFrame,
@@ -340,7 +350,7 @@ class DCNBase(BaseEstimator):
         group: GroupLike = None,
         eval_set: EvalSet | None = None,
         **kwargs: Any,
-    ) -> DCNBase:
+    ) -> FinalNetBase:
         """Fit the estimator on ``X`` and ``y``.
 
         Parameters
@@ -355,7 +365,7 @@ class DCNBase(BaseEstimator):
             the target column in ``X``.
         group : array-like or str or None, default=None
             Per-row query/group ids for ranking (array or column name). Ignored by
-            the classifier/regressor; required by :class:`DCNRanker` for
+            the classifier/regressor; required by :class:`FinalNetRanker` for
             group-aware losses.
         eval_set : tuple or None, default=None
             Validation data as ``(X_val, y_val)`` or ``(X_val, y_val, group_val)``.
@@ -366,7 +376,7 @@ class DCNBase(BaseEstimator):
 
         Returns
         -------
-        self : DCNBase
+        self : FinalNetBase
             The fitted estimator.
 
         """
@@ -449,12 +459,10 @@ class DCNBase(BaseEstimator):
             for c in cards
         ]
         loss_fn = self._make_loss()
-        is_coral = isinstance(loss_fn, CORALLayerLoss)
-        if is_coral and not hasattr(self, "n_classes_"):
-            raise ValueError("loss='coral_layer' is only supported by DCNClassifier")
-        # CORAL needs num_classes (K) instead of out_features (K-1) at the head;
-        # the factory interprets n_outputs accordingly when use_coral_head=True.
-        n_outputs = int(self.n_classes_) if is_coral else self._resolve_n_outputs()
+        if isinstance(loss_fn, CORALLayerLoss):
+            raise TypeError("loss='coral_layer' is not supported by FinalNet")
+        n_outputs = self._resolve_n_outputs()
+        self._validate_2b_consistency_loss(loss_fn, n_outputs)
         embedding_input_dims = self.preprocessor_.embedding_input_dims_
         if self.embedding_encoders and not embedding_input_dims:
             raise ValueError("embedding_encoders requires embedding_features")
@@ -464,33 +472,32 @@ class DCNBase(BaseEstimator):
                 self.embedding_encoders or {},
             )
 
-        model = build_dcnv2(
+        model = build_finalnet(
             n_num_features=len(self.preprocessor_.num_cols_),
             cardinalities=cards,
             embedding_dims=emb_dims,
-            cross_layers=self.cross_layers,
-            cross_rank=self.cross_rank,
-            hidden_units=list(self.hidden_units),
-            dropout=self.dropout,
-            structure=self.structure,
+            block_type=self.block_type,
+            block1_hidden_units=self.block1_hidden_units,
+            block2_hidden_units=self.block2_hidden_units,
+            block1_hidden_activations=self.block1_hidden_activations,
+            block2_hidden_activations=self.block2_hidden_activations,
+            block1_dropout=self.block1_dropout,
+            block2_dropout=self.block2_dropout,
+            batch_norm=self.batch_norm,
+            residual_type=self.residual_type,
+            interaction_activation=self.interaction_activation,
+            use_field_gate=self.use_field_gate,
             num_encoder=self.num_encoder,
             cat_encoder=self.cat_encoder,
-            gated_cross=self.gated_cross,
-            cross_type=self.cross_type,
-            mask_ratio=self.mask_ratio,
-            activation=self.activation,
-            batch_norm=self.batch_norm,
-            use_moe=self.use_moe,
-            num_experts=self.num_experts,
-            moe_top_k=self.moe_top_k,
-            use_inner_cross_layers=self.use_inner_cross_layers,
             num_encoder_bins=ple_bins,
             multihash_encoder=self.multihash_encoder,
             multihash_n_inputs=mh_n_inputs or None,
             embedding_encoders=embedding_encoders,
             embedding_input_dims=embedding_input_dims or None,
             n_outputs=n_outputs,
-            use_coral_head=is_coral,
+        )
+        training_loss = (
+            FinalNetConsistencyLoss(loss_fn) if self.use_2b_consistency_loss else loss_fn
         )
 
         # data sources; temp Arrow files (lazy path) are cleaned up on exit
@@ -516,7 +523,7 @@ class DCNBase(BaseEstimator):
             lr_scheduler_config = build_lr_scheduler_config(self.lr_scheduler)
             train_out = TrainingRun(
                 model,
-                loss_fn,
+                training_loss,
                 train_source,
                 val_source,
                 lr=self.lr,
@@ -542,7 +549,12 @@ class DCNBase(BaseEstimator):
 
         # keep fitted modules on CPU: pickling and re-fitting stay trivial
         self.model_ = module.model().cpu()
-        self.loss_ = module.loss_fn().cpu()
+        trained_loss = module.loss_fn()
+        if self.use_2b_consistency_loss:
+            if not isinstance(trained_loss, FinalNetConsistencyLoss):
+                raise TypeError("FinalNet training returned an unexpected loss module")
+            trained_loss = trained_loss.unwrap()
+        self.loss_ = trained_loss.cpu()
         self.history_ = history
         self.n_features_in_ = (
             len(self.preprocessor_.num_cols_)
@@ -568,22 +580,13 @@ class DCNBase(BaseEstimator):
             pickle.dump(self, f)
 
     @classmethod
-    def load(cls, path: str | Path) -> DCNBase:
+    def load(cls, path: str | Path) -> FinalNetBase:
         """Load an estimator saved with :meth:`save`."""
         with Path(path).open("rb") as f:
             obj = pickle.load(f)  # noqa: S301
         if not isinstance(obj, cls):
             raise TypeError(f"Expected saved {cls.__name__}, got {type(obj).__name__}")
         return obj
-
-    def _inference_device(self) -> torch.device:
-        if self.accelerator_config and self.accelerator_config.get("cpu"):
-            return torch.device("cpu")
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        if torch.backends.mps.is_available():
-            return torch.device("mps")
-        return torch.device("cpu")
 
     def _decision_scores(self, X: XLike) -> np.ndarray:
         check_is_fitted(self, "model_")
@@ -593,43 +596,18 @@ class DCNBase(BaseEstimator):
                 expected_features=self.n_features_in_,
                 estimator_name=type(self).__name__,
             )
-        frame = to_polars(X)
-        device = self._inference_device()
-        self.model_.to(device).eval()
-        try:
-            if isinstance(frame, pl.LazyFrame):
-                n_rows = frame.select(pl.len()).collect().item()
-                chunks = [
-                    self._score_frame(
-                        frame.slice(start, self.chunk_rows).collect(),
-                        device,
-                    )
-                    for start in range(0, n_rows, self.chunk_rows)
-                ]
-                return np.concatenate(chunks, axis=0)
-            return self._score_frame(frame, device)
-        finally:
-            self.model_.cpu()
-
-    @torch.no_grad()
-    def _score_frame(self, df: pl.DataFrame, device: torch.device) -> np.ndarray:
-        num, cat, extra = self.preprocessor_.transform(df)
-        outputs = []
-        for start in range(0, len(num), self.batch_size):
-            stop = start + self.batch_size
-            batch = {
-                "num": torch.from_numpy(num[start:stop]).to(device),
-                "cat": torch.from_numpy(cat[start:stop]).to(device),
-            }
-            batch.update(
-                {name: torch.from_numpy(arr[start:stop]).to(device) for name, arr in extra.items()},
-            )
-            outputs.append(self.model_(batch).float().cpu().numpy())
-        return np.concatenate(outputs, axis=0) if outputs else np.zeros((0,), dtype=np.float32)
+        return score_tabular_model(
+            model=self.model_,
+            preprocessor=self.preprocessor_,
+            frame=to_polars(X),
+            batch_size=self.batch_size,
+            chunk_rows=self.chunk_rows,
+            accelerator_config=self.accelerator_config,
+        )
 
 
-class DCNClassifier(ClassifierMixin, DCNBase):
-    """DCNv2 classifier (binary or multiclass).
+class FinalNetClassifier(ClassifierMixin, FinalNetBase):
+    """FinalNet classifier (binary or multiclass).
 
     A scikit-learn ``ClassifierMixin``. Binary problems train a single logit with
     ``bce`` (the default; any pointwise/ordinal loss also works). Multiclass
@@ -637,7 +615,7 @@ class DCNClassifier(ClassifierMixin, DCNBase):
     strings, or booleans; the fitted classes are stored in ``classes_`` and
     predictions are mapped back to the original labels.
 
-    See :class:`DCNBase` for the full list of hyperparameters.
+    See :class:`FinalNetBase` for the full list of hyperparameters.
 
     Attributes
     ----------
@@ -649,9 +627,9 @@ class DCNClassifier(ClassifierMixin, DCNBase):
     Examples
     --------
     >>> import polars as pl
-    >>> from scikit_rank import DCNClassifier
+    >>> from scikit_rank import FinalNetClassifier
     >>> X = pl.DataFrame({"num": [0.1, 1.2, -0.3], "cat": ["a", "b", "a"]})
-    >>> clf = DCNClassifier(epochs=5, num_features=["num"], cat_features=["cat"])
+    >>> clf = FinalNetClassifier(epochs=5, num_features=["num"], cat_features=["cat"])
     >>> clf.fit(X, [0, 1, 0])                       # doctest: +SKIP
     >>> clf.predict_proba(X).shape                  # doctest: +SKIP
     (3, 2)
@@ -659,6 +637,7 @@ class DCNClassifier(ClassifierMixin, DCNBase):
     """
 
     _default_loss = "bce"
+    _supports_2b_consistency_loss = True
 
     def _fit_target_meta(
         self,
@@ -666,23 +645,10 @@ class DCNClassifier(ClassifierMixin, DCNBase):
         y: YLike,
         target_col: str | None,
     ) -> None:
-        if target_col is not None:
-            values = (
-                frame.lazy()
-                .select(pl.col(target_col).unique().sort())
-                .collect()
-                .to_series()
-                .to_numpy()
-            )
-        else:
-            y_arr = to_numpy_1d(y)
-            # Reject regression-style continuous targets up-front so the error
-            # matches sklearn's expected wording (check_classifiers_regression_target).
-            check_classification_targets(y_arr)
-            values = np.unique(y_arr)
-        self._label_encoder_ = LabelEncoder().fit(values)
-        self.classes_ = self._label_encoder_.classes_
-        self.n_classes_ = len(self.classes_)
+        self._classification_target_ = ClassificationTarget.fit(frame, y, target_col)
+        self._label_encoder_ = self._classification_target_.label_encoder
+        self.classes_ = self._classification_target_.classes
+        self.n_classes_ = self._classification_target_.n_classes
 
     def _resolve_n_outputs(self) -> int:
         return 1 if self.n_classes_ <= 2 else self.n_classes_
@@ -694,10 +660,10 @@ class DCNClassifier(ClassifierMixin, DCNBase):
         group: GroupLike = None,
         eval_set: EvalSet | None = None,
         **kwargs: Any,
-    ) -> DCNClassifier:
+    ) -> FinalNetClassifier:
         """Fit the classifier, inferring ``classes_`` before training.
 
-        Same signature as :meth:`DCNBase.fit`. ``y`` (or the column it names) may
+        Same signature as :meth:`FinalNetBase.fit`. ``y`` (or the column it names) may
         hold integer, string, or boolean labels; two classes train a single-logit
         ``bce`` head and more than two train a ``cross_entropy`` head.
         """
@@ -720,18 +686,10 @@ class DCNClassifier(ClassifierMixin, DCNBase):
         return super().fit(X, y=y, group=group, eval_set=eval_set)
 
     def _prepare_y(self, y: np.ndarray) -> np.ndarray:
-        return self._label_encoder_.transform(y).astype(np.float32)
+        return self._classification_target_.encode(y)
 
     def _y_expr(self, target_col: str) -> pl.Expr:
-        # build mapping keys through polars' own String cast so the string
-        # rendering matches the casted column exactly (e.g. bools: "true")
-        classes = pl.Series(self.classes_).cast(pl.String).to_list()
-        codes = [float(i) for i in range(self.n_classes_)]
-        return (
-            pl.col(target_col)
-            .cast(pl.String)
-            .replace_strict(classes, codes, default=None, return_dtype=pl.Float32)
-        )
+        return self._classification_target_.expression(target_col)
 
     def predict_proba(self, X: XLike) -> np.ndarray:
         """Predict class probabilities for ``X``.
@@ -749,23 +707,7 @@ class DCNClassifier(ClassifierMixin, DCNBase):
 
         """
         scores = self._decision_scores(X)
-        if scores.ndim == 1:  # binary, single logit
-            p1 = expit(scores)
-            return np.stack([1.0 - p1, p1], axis=1)
-        if isinstance(self.model_.head(), CoralLayer):
-            # CORAL logits are cumulative P(Y >= k), k=1..K-1. Convert to
-            # mutually-exclusive class probabilities and enforce monotonicity
-            # defensively in case learned raw biases cross.
-            p_ge = np.minimum.accumulate(expit(scores), axis=1)
-            return np.concatenate(
-                [
-                    1.0 - p_ge[:, :1],
-                    p_ge[:, :-1] - p_ge[:, 1:],
-                    p_ge[:, -1:],
-                ],
-                axis=1,
-            )
-        return softmax(scores, axis=1)
+        return class_probabilities(scores)
 
     def predict(self, X: XLike) -> np.ndarray:
         """Predict class labels for ``X``.
@@ -780,17 +722,17 @@ class DCNClassifier(ClassifierMixin, DCNBase):
         return self.classes_[np.argmax(proba, axis=1)]
 
 
-class DCNRegressor(RegressorMixin, DCNBase):
-    """DCNv2 regressor.
+class FinalNetRegressor(RegressorMixin, FinalNetBase):
+    """FinalNet regressor.
 
     A scikit-learn ``RegressorMixin`` predicting a single continuous target,
-    trained with ``mse`` by default. See :class:`DCNBase` for the full list of
+    trained with ``mse`` by default. See :class:`FinalNetBase` for the full list of
     hyperparameters.
 
     Examples
     --------
-    >>> from scikit_rank import DCNRegressor
-    >>> reg = DCNRegressor(epochs=5, num_features=["num"], cat_features=["cat"])
+    >>> from scikit_rank import FinalNetRegressor
+    >>> reg = FinalNetRegressor(epochs=5, num_features=["num"], cat_features=["cat"])
     >>> reg.fit(X, y_reg)          # doctest: +SKIP
     >>> reg.predict(X).shape       # doctest: +SKIP
     (n_samples,)
@@ -811,20 +753,20 @@ class DCNRegressor(RegressorMixin, DCNBase):
         return self._decision_scores(X)
 
 
-class DCNRanker(DCNBase):
-    """DCNv2 learning-to-rank estimator.
+class FinalNetRanker(FinalNetBase):
+    """FinalNet learning-to-rank estimator.
 
     Trains a per-row relevance score with a ranking loss (``lambdarank`` by
     default; also ``bpr``, listwise/softmax, etc.). Call
     ``fit(X, y, group=...)`` where ``group`` is a per-row query id array, or a
     column name when ``X`` is a polars (Lazy)Frame. Batches never split a group,
-    so pairwise/listwise losses always see complete groups. See :class:`DCNBase`
+    so pairwise/listwise losses always see complete groups. See :class:`FinalNetBase`
     for the full list of hyperparameters.
 
     Examples
     --------
-    >>> from scikit_rank import DCNRanker
-    >>> ranker = DCNRanker(loss="listwise", epochs=5)
+    >>> from scikit_rank import FinalNetRanker
+    >>> ranker = FinalNetRanker(loss="listwise", epochs=5)
     >>> ranker.fit(df, y="click", group="impression_id")   # doctest: +SKIP
     >>> scores = ranker.predict(df)                        # doctest: +SKIP
 
@@ -839,17 +781,17 @@ class DCNRanker(DCNBase):
         group: GroupLike = None,
         eval_set: EvalSet | None = None,
         **kwargs: Any,
-    ) -> DCNRanker:
+    ) -> FinalNetRanker:
         """Fit the ranker on grouped data.
 
-        Same signature as :meth:`DCNBase.fit`. ``group`` (a per-row query-id
+        Same signature as :meth:`FinalNetBase.fit`. ``group`` (a per-row query-id
         array, or a column name when ``X`` is a polars (Lazy)Frame) is required
         for group-aware losses and raises ``ValueError`` if missing.
         """
         loss_fn = self._make_loss()
         if group is None and loss_fn.requires_group:
             raise ValueError(
-                "DCNRanker.fit requires `group` (per-row query ids or a column name).",
+                "FinalNetRanker.fit requires `group` (per-row query ids or a column name).",
             )
         return super().fit(X, y=y, group=group, eval_set=eval_set, **kwargs)
 

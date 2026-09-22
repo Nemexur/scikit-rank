@@ -3,12 +3,15 @@
 This directory contains the **final results** and **everything needed to reproduce
 them** for the comparison of DCNv2 (`scikit_rank.DCNClassifier`) against gradient-boosting
 baselines (LightGBM / CatBoost / XGBoost) and against the reference DCNv2 implementation
-from FuxiCTR, on the two pre-split datasets of the
-**[BARS-CTR](https://openbenchmark.github.io/BARS/)** benchmark — `criteo_x1` and
+from FuxiCTR, plus experiment configs for FinalMLP, FinalNet, TabM and DESTINE, on the two
+pre-split datasets of the **[BARS-CTR](https://openbenchmark.github.io/BARS/)** benchmark — `criteo_x1` and
 `avazu_x1`. The FuxiCTR runs are **not** reproduced here; the published 5-seed FuxiCTR
 results are available upstream:
 [Criteo_x1](https://github.com/reczoo/BARS/tree/main/ranking/ctr/DCNv2/DCNv2_criteo_x1)
 and [Avazu_x1](https://github.com/reczoo/BARS/tree/main/ranking/ctr/DCNv2/DCNv2_avazu_x1).
+
+The frozen DESTINE configurations and earlier five-seed measurements are documented in
+[`DESTINE_PORTING_NOTES.md`](../DESTINE_PORTING_NOTES.md).
 
 All runs go through a **single config-driven runner**, `train.py`: one YAML
 configuration per (model × dataset), an identical evaluation protocol for every model
@@ -25,9 +28,9 @@ exps/bars/
 ├── train.py            # single runner: --config <yaml> [--random-state N] [--output-dir ...]
 ├── _datasets.py        # dataset registry (name, label, reference split MD5s from BARS)
 ├── _data.py            # split loading, categorical vocab encoding, MD5 verification
-├── _adapters.py        # per-model adapters (GBDT + DCN); uniform run() contract
+├── _adapters.py        # per-model adapters (GBDT + DCN/FinalMLP/FinalNet/TabM); uniform run() contract
 ├── _reporting.py       # ClearML tracking (optional) + on-disk artifacts
-├── configs/            # 10 YAML configs (model × dataset × ablation)
+├── configs/            # YAML configs (model × dataset × ablation)
 └── results/            # published metrics: <dataset>/<group>/seed-<seed>/metrics.json
 ```
 
@@ -54,6 +57,11 @@ The subfolder name in `results/<dataset>/<group>/` corresponds to a config:
 | Group (`group`) | Dataset | Config | Model / what is tested |
 |---|---|---|---|
 | `bars_parity`  | criteo_x1, avazu_x1 | `config_dcn_<ds>.yaml` | **DCNv2, parity with FuxiCTR** — the BARS reference point |
+| `final_mlp`    | criteo_x1, avazu_x1 | `config_final_mlp_<ds>.yaml` | FinalMLP settings from the RecBench reference runs |
+| `finalnet_2b`  | criteo_x1, avazu_x1 | `config_finalnet_2b_<ds>.yaml` | Selected FinalNet-2B RecBench runs, including field gate and consistency loss |
+| `tabm`         | criteo_x1, avazu_x1 | `config_tabm_<ds>.yaml` | Untuned TabM CTR baseline with shared training batches and binary cross-entropy |
+| `tabm_dcn` | criteo_x1, avazu_x1 | `config_tabm_dcn_<ds>.yaml` | TabM backbone with the corresponding DCN encoding and training hyperparameters |
+| `tabm_final_mlp` | criteo_x1, avazu_x1 | `config_tabm_final_mlp_<ds>.yaml` | TabM backbone with the corresponding FinalMLP encoding and training hyperparameters |
 | `num_encoding` | criteo_x1 | `config_dcn_criteo_x1_num_encoding.yaml` | DCNv2 + PLE numeric encoder (ablation; criteo only) |
 | `cat_encoding` | avazu_x1  | `config_dcn_avazu_x1_multihash.yaml` | DCNv2 + multihash / Unified Embedding (ablation; avazu only) |
 | `lgbm`         | criteo_x1, avazu_x1 | `config_lgbm_<ds>.yaml`     | LightGBM (baseline) |
@@ -240,7 +248,7 @@ The script takes a directory of per-run subfolders (`seed-*/metrics.json`), read
 
 ### 1. Environment
 
-The project uses `uv` (Python ≥3.12). DCN requires the full environment
+The project uses `uv` (Python ≥3.12). DCN, FinalMLP and TabM require the full environment
 (torch/accelerate/scikit_rank); the GBDT baselines can be installed as lean groups:
 
 ```bash
@@ -266,6 +274,63 @@ uv run python exps/bars/train.py \
     --random-state 2021 \
     --output-dir output/criteo_bars_parity/seed-2021
 ```
+
+FinalMLP uses the same runner and data pipeline:
+
+```bash
+uv run python exps/bars/train.py \
+    --config exps/bars/configs/config_final_mlp_criteo_x1.yaml \
+    --random-state 2021 \
+    --output-dir output/criteo_final_mlp/seed-2021
+```
+
+FinalNet-2B uses the selected RecBench architecture for each dataset:
+
+```bash
+uv run python exps/bars/train.py \
+    --config exps/bars/configs/config_finalnet_2b_criteo_x1.yaml \
+    --random-state 2021 \
+    --output-dir output/criteo_finalnet_2b/seed-2021
+```
+
+TabM also uses the same runner. Its configs use shared training batches and a
+single-logit binary cross-entropy classification contract:
+
+```bash
+uv run python exps/bars/train.py \
+    --config exps/bars/configs/config_tabm_criteo_x1.yaml \
+    --random-state 2021 \
+    --output-dir output/criteo_tabm/seed-2021
+```
+
+For backbone-only comparisons with DCN or FinalMLP, use the dedicated configs.
+They retain the corresponding source model's feature encoding, loss,
+optimization, regularization, batch size, scheduler and early stopping settings:
+
+```bash
+uv run python exps/bars/train.py \
+    --config exps/bars/configs/config_tabm_final_mlp_criteo_x1.yaml \
+    --random-state 2021 \
+    --output-dir output/criteo_tabm_final_mlp/seed-2021
+
+uv run python exps/bars/train.py \
+    --config exps/bars/configs/config_tabm_dcn_criteo_x1.yaml \
+    --random-state 2021 \
+    --output-dir output/criteo_tabm_dcn/seed-2021
+```
+
+Ready-to-submit H100 presets for the remote environment are located at:
+
+- `exps/presets/bars/repr_preset_tabm_criteo.yml`;
+- `exps/presets/bars/repr_preset_tabm_avazu.yml`;
+- `exps/presets/bars/repr_preset_tabm_dcn_criteo.yml`;
+- `exps/presets/bars/repr_preset_tabm_dcn_avazu.yml`;
+- `exps/presets/bars/repr_preset_tabm_final_mlp_criteo.yml`;
+- `exps/presets/bars/repr_preset_tabm_final_mlp_avazu.yml`.
+
+All six presets use distinct ClearML task names and store artifacts in distinct
+output directories. They remain grouped under the per-dataset `final_mlp`
+ClearML project.
 
 A GBDT baseline — with the corresponding group:
 
@@ -304,5 +369,17 @@ The trained model is not saved. ClearML logging is optional: add
   `valid` (early stopping), then metrics on `valid` and `test`. The categorical encoding is
   identical for the GBDT models and DCN (all train uniques, OOV → 0), which makes the
   comparison directly head-to-head.
+- **The FinalNet-2B configs reproduce the selected RecBench parameter sets, not the exact
+  FuxiCTR execution environment.** RecBench used Adam; this library uses AdamW with
+  `weight_decay: 0.0`, which gives the same update rule but does not guarantee bitwise-identical
+  kernels or training trajectories. The configs explicitly disable the library-specific
+  interaction activation and enable the reference field gate and 2B consistency loss.
+- **The standalone TabM configurations are starting points, not published BARS results.** The
+  TabM paper does not report tuned Criteo_x1 or Avazu_x1 hyperparameters. The
+  `config_tabm_<ds>.yaml` configs use `k=32`, the default 3×512 ReLU backbone, BCE,
+  AdamW defaults, BF16 and gradient clipping, while retaining scikit-rank categorical
+  embeddings instead of the paper pipeline's one-hot encoding. The `config_tabm_dcn_<ds>.yaml` and
+  `config_tabm_final_mlp_<ds>.yaml` variants keep that TabM backbone but copy all
+  non-architecture hyperparameters from DCN and FinalMLP respectively.
 - **`bars_parity` is the reference point**: the DCNv2 implementation in `scikit_rank` is brought
   to parity with FuxiCTR DCNv2 (the model behind the BARS-CTR leaderboard).

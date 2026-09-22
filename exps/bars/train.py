@@ -1,7 +1,7 @@
 """Unified experiment runner: train a CTR model on a pre-split BARS dataset.
 
-Config-driven runner for the three GBDT baselines (LightGBM/CatBoost/XGBoost) or DCNv2
-(via ``scikit_rank.DCNClassifier``) on ``avazu_x1`` / ``criteo_x1``.
+Config-driven runner for the three GBDT baselines (LightGBM/CatBoost/XGBoost), DCNv2,
+FinalMLP, FinalNet or TabM on ``avazu_x1`` / ``criteo_x1``.
 
 Everything lives in a YAML ``--config`` (model, dataset, feature lists, data_dir and a
 nested ``model_params:`` of native library kwargs); the CLI carries only ``--output-dir``,
@@ -64,7 +64,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     seed-sweeps reuse one config.
     """
     p = argparse.ArgumentParser(
-        description="Train a CTR classifier (lgbm/catboost/xgboost/dcn) from a YAML config.",
+        description="Train a CTR classifier from a YAML config.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument(

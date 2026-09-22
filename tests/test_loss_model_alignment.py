@@ -88,6 +88,28 @@ def test_training_module_validates_score_target_batch_length() -> None:
         module(batch)
 
 
+class _TupleOutputModel(torch.nn.Module):
+    def forward(
+        self,
+        inputs: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        logits = inputs["num"].squeeze(1)
+        return logits, torch.stack((logits, -logits), dim=1)
+
+
+def test_training_module_uses_first_tuple_item_as_logits() -> None:
+    module = TrainingModule(_TupleOutputModel(), BCELoss())
+    batch = {
+        "num": torch.tensor([[-1.0], [2.0]]),
+        "target": torch.tensor([0.0, 1.0]),
+    }
+
+    output = module(batch)
+
+    assert torch.equal(output["logits"], torch.tensor([-1.0, 2.0]))
+    assert torch.equal(output["loss"], BCELoss()(output["logits"], batch["target"]))
+
+
 def test_training_module_validates_score_group_batch_length() -> None:
     class _Model(torch.nn.Module):
         def forward(self, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
