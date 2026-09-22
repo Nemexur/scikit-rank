@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from sklearn.utils import Tags
 
     from scikit_rank.sklearn._types import EvalSet, GroupLike, XLike, YLike
+    from scikit_rank.train.options import TrainingOptions
 
 
 class FinalMLPBase(BaseEstimator):
@@ -172,6 +173,7 @@ class FinalMLPBase(BaseEstimator):
         chunk_rows: int = 100_000,
         random_state: int | None = None,
         accelerator_config: dict[str, Any] | None = None,
+        training_options: TrainingOptions | None = None,
         verbose: bool = False,
     ) -> None:
         self.embedding_dim = embedding_dim
@@ -206,6 +208,7 @@ class FinalMLPBase(BaseEstimator):
         self.chunk_rows = chunk_rows
         self.random_state = random_state
         self.accelerator_config = accelerator_config
+        self.training_options = training_options
         self.verbose = verbose
         self.mlp1_hidden_units = mlp1_hidden_units
         self.mlp1_hidden_activations = mlp1_hidden_activations
@@ -457,6 +460,7 @@ class FinalMLPBase(BaseEstimator):
                 ),
                 epochs=self.epochs,
                 accelerator_config=self.accelerator_config,
+                training_options=self.training_options,
                 early_stopping_rounds=self.early_stopping_rounds,
                 verbose=self.verbose,
                 eval_metric_fn=self.eval_metric,

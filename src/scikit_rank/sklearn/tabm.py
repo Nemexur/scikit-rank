@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from sklearn.utils import Tags
 
     from scikit_rank.sklearn._types import EvalSet, GroupLike, XLike, YLike
+    from scikit_rank.train.options import TrainingOptions
 
 
 class TabMBase(BaseEstimator):
@@ -115,7 +116,7 @@ class TabMBase(BaseEstimator):
 
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         *,
         n_blocks: int = 3,
@@ -157,6 +158,7 @@ class TabMBase(BaseEstimator):
         chunk_rows: int = 100_000,
         random_state: int | None = None,
         accelerator_config: dict[str, Any] | None = None,
+        training_options: TrainingOptions | None = None,
         verbose: bool = False,
     ) -> None:
         self.embedding_dim = embedding_dim
@@ -191,6 +193,7 @@ class TabMBase(BaseEstimator):
         self.chunk_rows = chunk_rows
         self.random_state = random_state
         self.accelerator_config = accelerator_config
+        self.training_options = training_options
         self.verbose = verbose
         self.n_blocks = n_blocks
         self.d_block = d_block
@@ -445,6 +448,7 @@ class TabMBase(BaseEstimator):
                 ),
                 epochs=self.epochs,
                 accelerator_config=self.accelerator_config,
+                training_options=self.training_options,
                 early_stopping_rounds=self.early_stopping_rounds,
                 verbose=self.verbose,
                 eval_metric_fn=self.eval_metric,

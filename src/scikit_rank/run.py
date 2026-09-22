@@ -25,6 +25,7 @@ from scikit_rank.train.options import (
     BestStateSaver,
     EmaAverager,
     EvalMetricFn,
+    TrainingOptions,
     attach_early_stopping,
     attach_embedding_regularizer,
     attach_epoch_logger,
@@ -178,6 +179,11 @@ class TrainingRun:
         EMA weights are restored when validation is available; otherwise the
         final EMA weights are used. Do not combine this with
         ``schedulefree_adamw``.
+    training_options : sequence of callable or None, default=None
+        Ordered callbacks with signature ``option(trainer, accelerator)``.
+        Each is called once after the library's standard training handlers are
+        installed and before :meth:`run`. Use them to add Ignite handlers,
+        metrics, or diagnostics.
 
     Notes
     -----
@@ -209,18 +215,19 @@ class TrainingRun:
         grad_clip_norm: float | None = None,
         embedding_regularizer: float = 0.0,
         ema_decay: float | None = None,
+        training_options: TrainingOptions | None = None,
     ) -> None:
         self._epochs = epochs
         self._early_stopping_rounds = early_stopping_rounds
         self._verbose = verbose
         self._grad_clip_norm = grad_clip_norm
+        self._training_options = tuple(training_options) if training_options else ()
 
         self._eval_metric_fn = eval_metric_fn
         self._eval_metric_name = "loss" if eval_metric_fn is None else eval_metric_name
         self._eval_metric_direction = "min" if eval_metric_fn is None else eval_metric_direction
         self._eval_metric_group_aware = eval_metric_group_aware
 
-        self._accelerator = Accelerator(**(accelerator_config or {}))
         self._history: list[dict[str, float]] = []
 
         self._embedding_regularizer = embedding_regularizer
@@ -229,12 +236,14 @@ class TrainingRun:
             if embedding_regularizer > 0.0 and hasattr(model, "embedding_parameters")
             else []
         )
-        self._module = TrainingModule(
-            model=self._accelerator.prepare_model(model),
+
+        self.accelerator = Accelerator(**(accelerator_config or {}))
+        self.model = TrainingModule(
+            model=self.accelerator.prepare_model(model),
             loss_fn=(
-                self._accelerator.prepare_model(loss_fn)
+                self.accelerator.prepare_model(loss_fn)
                 if any(p.requires_grad for p in loss_fn.parameters())
-                else loss_fn.to(self._accelerator.device)
+                else loss_fn.to(self.accelerator.device)
             ),
         )
         optimizer = optimizer or OptimizerConfig()
@@ -244,34 +253,33 @@ class TrainingRun:
                 "schedulefree_adamw already maintains an internal weight average; "
                 "enabling ema_decay on top double-averages -- pick one.",
             )
-        self._optimizer = self._accelerator.prepare_optimizer(
-            build_optimizer(self._module, optimizer),
+        self.optimizer = self.accelerator.prepare_optimizer(
+            build_optimizer(self.model, optimizer),
         )
-        self._lr_scheduler = (
-            build_lr_scheduler(self._optimizer, lr_scheduler, self._eval_metric_direction)
+        self.lr_scheduler = (
+            build_lr_scheduler(self.optimizer, lr_scheduler, self._eval_metric_direction)
             if lr_scheduler is not None
             else None
         )
-        self._loaders: dict[str, DataLoader] = {
-            "train": _prepare_source_loader(train_source, self._accelerator),
+        self.loaders: dict[str, DataLoader] = {
+            "train": _prepare_source_loader(train_source, self.accelerator),
         }
         if val_source is not None:
-            self._loaders["eval"] = _prepare_source_loader(val_source, self._accelerator)
-        self._trainer = Trainer(self._module, self._optimizer, self._accelerator)
+            self.loaders["eval"] = _prepare_source_loader(val_source, self.accelerator)
+        self.trainer = Trainer(self.model, self.optimizer, self.accelerator)
+
         self._ema = (
-            EmaAverager(self._module, self._accelerator, ema_decay)
-            if ema_decay is not None
-            else None
+            EmaAverager(self.model, self.accelerator, ema_decay) if ema_decay is not None else None
         )
         self._saver = self._attach_handlers()
 
     def run(self) -> RunOutput:
-        state = self._trainer.run(self._loaders, epochs=self._epochs)
+        state = self.trainer.run(self.loaders, epochs=self._epochs)
         # Leave schedule-free optimizers in eval mode.
-        self._trainer.set_optimizer_mode(train=False)
+        self.trainer.set_optimizer_mode(train=False)
         if dist.is_available() and dist.is_initialized():
             dist.barrier()
-        self._accelerator.end_training()
+        self.accelerator.end_training()
         if self._saver is not None:
             # With an eval set the saver already holds the best (EMA-if-enabled)
             # snapshot; restoring it also lands the averaged weights.
@@ -282,8 +290,8 @@ class TrainingRun:
             self._ema.copy_to()
         return RunOutput(
             module=TrainingModule(
-                self._accelerator.unwrap_model(self._module.model()),
-                self._accelerator.unwrap_model(self._module.loss_fn()),
+                self.accelerator.unwrap_model(self.model.model()),
+                self.accelerator.unwrap_model(self.model.loss_fn()),
             ),
             metrics=state.metrics,
             history=self._history,
@@ -292,51 +300,53 @@ class TrainingRun:
     def _attach_handlers(self) -> BestStateSaver | None:
         saver: BestStateSaver | None = None
         if self._grad_clip_norm is not None:
-            attach_grad_clipping(self._trainer, self._accelerator, self._grad_clip_norm)
+            attach_grad_clipping(self.trainer, self.accelerator, self._grad_clip_norm)
         if self._embedding_regularizer > 0.0 and self._embedding_params:
             attach_embedding_regularizer(
-                self._trainer,
+                self.trainer,
                 self._embedding_params,
                 self._embedding_regularizer,
             )
         if self._ema is not None:
-            self._trainer.add_event("train", ModelEvents.OPTIMIZER_COMPLETED, self._ema.update)
-            if "eval" in self._loaders:
-                self._trainer.add_event("eval", Events.STARTED, self._ema.store)
-                self._trainer.add_event("train", Events.EPOCH_COMPLETED, self._ema.restore_live)
-        if "eval" in self._loaders:
+            self.trainer.add_event("train", ModelEvents.OPTIMIZER_COMPLETED, self._ema.update)
+            if "eval" in self.loaders:
+                self.trainer.add_event("eval", Events.STARTED, self._ema.store)
+                self.trainer.add_event("train", Events.EPOCH_COMPLETED, self._ema.restore_live)
+        if "eval" in self.loaders:
             if self._eval_metric_fn is not None:
                 attach_metric(
-                    self._trainer,
-                    self._accelerator,
+                    self.trainer,
+                    self.accelerator,
                     self._eval_metric_name,
                     self._eval_metric_fn,
                     group_aware=self._eval_metric_group_aware,
                 )
             saver = BestStateSaver(
-                self._trainer.model,
-                self._accelerator,
+                self.trainer.model,
+                self.accelerator,
                 metric_name=self._eval_metric_name,
                 direction=self._eval_metric_direction,
             )
-            self._trainer.add_event("eval", Events.COMPLETED, saver)
+            self.trainer.add_event("eval", Events.COMPLETED, saver)
             if self._early_stopping_rounds is not None:
                 attach_early_stopping(
-                    self._trainer,
+                    self.trainer,
                     metric_name=self._eval_metric_name,
                     patience=self._early_stopping_rounds,
                     direction=self._eval_metric_direction,
                     min_delta=1e-6 if self._eval_metric_fn is not None else 1e-4,
                 )
-            if self._lr_scheduler is not None:
+            if self.lr_scheduler is not None:
                 attach_lr_scheduler(
-                    self._trainer,
-                    self._lr_scheduler,
+                    self.trainer,
+                    self.lr_scheduler,
                     metric_name=self._eval_metric_name,
                 )
-        if self._verbose and self._accelerator.is_main_process:
-            attach_progress_bar(self._trainer, metric_names={"train": ["loss"], "eval": ["loss"]})
-        attach_epoch_logger(self._trainer, self._history)
+        if self._verbose and self.accelerator.is_main_process:
+            attach_progress_bar(self.trainer, metric_names={"train": ["loss"], "eval": ["loss"]})
+        attach_epoch_logger(self.trainer, self._history)
+        for option in self._training_options:
+            option(self.trainer, self.accelerator)
         return saver
 
 
