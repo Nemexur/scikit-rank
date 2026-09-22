@@ -36,7 +36,84 @@ if TYPE_CHECKING:
 
 
 class TabMBase(BaseEstimator):
-    """Shared TabM architecture parameters over the common estimator pipeline."""
+    """Shared fit/predict machinery for the TabM estimators.
+
+    Do not instantiate this class directly. Use :class:`TabMClassifier`,
+    :class:`TabMRegressor`, or :class:`TabMRanker`. The explicit constructor
+    parameters work with sklearn ``clone``, ``get_params``/``set_params``, and
+    ``GridSearchCV``.
+
+    Parameters
+    ----------
+    n_blocks : int, default=3
+        Number of TabM residual blocks per ensemble member.
+    d_block : int, default=512
+        Hidden width of each TabM block.
+    dropout : float, default=0.1
+        Dropout probability in TabM blocks.
+    activation : str, default="ReLU"
+        Activation used by TabM blocks.
+    k : int, default=32
+        Number of ensemble members trained with shared weights.
+    arch_type : {"tabm", "tabm-mini"}, default="tabm"
+        TabM architecture variant. ``"tabm-packed"`` is not supported.
+    start_scaling_init : {"random-signs", "normal"} or None, default=None
+        Initializer for feature-wise ensemble scaling. ``None`` selects a
+        compatible default for the configured feature encoders.
+    embedding_dim : int or None, default=None
+        Categorical embedding width. ``None`` uses a per-column fast.ai-style
+        cardinality heuristic.
+    num_encoder, cat_encoder : str or torch.nn.Module
+        Numeric and categorical encoder specifications. ``num_encoder="ple"``
+        enables piecewise-linear numeric encoding.
+    loss : str or Loss or None, default=None
+        Loss specification or instance. ``None`` selects the task default:
+        ``bce``/``cross_entropy``, ``mse``, or ``lambdarank``.
+    lr, weight_decay, optimizer, optimizer_kwargs
+        Optimizer configuration. TabM does not support ``optimizer="muon"``.
+    epochs : int, default=10
+        Maximum training epochs.
+    batch_size : int, default=1024
+        Mini-batch size. Ranking batches preserve query boundaries.
+    early_stopping_rounds, eval_metric, eval_metric_name,
+    eval_metric_direction, eval_metric_group_aware
+        Validation and early-stopping configuration. Early stopping requires an
+        ``eval_set`` passed to :meth:`fit`.
+    num_features, cat_features : sequence of str or None, default=None
+        Explicit feature columns. ``None`` infers columns from input dtypes.
+    multihash_features, multihash_encoder
+        High-cardinality columns and their shared hashed encoder.
+    embedding_features, embedding_encoders
+        Named columns containing external embedding vectors and their encoders.
+    normalize_numeric, n_quantiles, numeric_nan_fill, ple_n_bins
+        Numeric preprocessing and PLE-bin configuration.
+    lr_scheduler, grad_clip_norm, embedding_regularizer, ema_decay
+        Optional scheduler, optimization, and weight-averaging controls.
+    chunk_rows : int, default=100_000
+        Streaming chunk size for lazy training and inference.
+    random_state : int or None, default=None
+        Torch and NumPy random seed.
+    accelerator_config : dict or None, default=None
+        Keyword arguments for :class:`accelerate.Accelerator`.
+    verbose : bool, default=False
+        Print training progress and epoch logs.
+
+    Attributes
+    ----------
+    model_ : torch.nn.Module
+        Fitted TabM ensemble, retained on CPU for stable pickling.
+    loss_ : Loss
+        Instantiated base loss used for every ensemble member.
+    history_ : list[dict[str, float]]
+        Per-epoch train and validation metrics.
+    preprocessor_ : TabularPreprocessor
+        Fitted feature preprocessor.
+    n_features_in_ : int
+        Number of fitted input features.
+    feature_names_in_ : numpy.ndarray
+        Input feature names in preprocessing order.
+
+    """
 
     def __init__(
         self,
@@ -218,7 +295,32 @@ class TabMBase(BaseEstimator):
         eval_set: EvalSet | None = None,
         **kwargs: Any,
     ) -> Self:
-        """Fit the estimator on tabular features and a task-specific target."""
+        """Fit the estimator on ``X`` and ``y``.
+
+        Parameters
+        ----------
+        X : numpy.ndarray, pandas.DataFrame, polars.DataFrame, or polars.LazyFrame
+            Training features. String categoricals and NaNs are handled natively.
+            With a lazy frame, the data is preprocessed and streamed through a
+            temporary Arrow IPC file.
+        y : array-like or str, default=None
+            Target values, or a target-column name when ``X`` is a polars frame.
+        group : array-like or str or None, default=None
+            Per-row query ids for ranking losses. With a lazy frame, pass the
+            group-column name. Group-aware losses require this argument.
+        eval_set : tuple or None, default=None
+            Validation data as ``(X_val, y_val)`` or ``(X_val, y_val, group_val)``.
+            Required when ``early_stopping_rounds`` is set.
+        **kwargs
+            Unsupported. Passing fit parameters such as ``sample_weight`` raises
+            :class:`TypeError`.
+
+        Returns
+        -------
+        self
+            The fitted estimator.
+
+        """
         if kwargs:
             raise TypeError(
                 f"{type(self).__name__}.fit() got unexpected keyword "
@@ -409,7 +511,21 @@ class TabMBase(BaseEstimator):
 
 
 class TabMClassifier(ClassifierMixin, TabMBase):
-    """TabM classifier."""
+    """TabM classifier for binary, multiclass, and ordinal targets.
+
+    Binary targets use ``bce`` and multiclass targets use ``cross_entropy`` by
+    default. ``loss="coral_layer"`` enables an ordinal output head. Fitted labels
+    are stored in ``classes_``. See :class:`TabMBase` for parameters.
+
+    Examples
+    --------
+    >>> from scikit_rank import TabMClassifier
+    >>> classifier = TabMClassifier(k=8, epochs=5, num_features=["num"])
+    >>> classifier.fit(X, y)  # doctest: +SKIP
+    >>> classifier.predict_proba(X).shape  # doctest: +SKIP
+    (n_samples, n_classes)
+
+    """
 
     _default_loss = "bce"
 
@@ -494,7 +610,18 @@ class TabMClassifier(ClassifierMixin, TabMBase):
 
 
 class TabMRegressor(RegressorMixin, TabMBase):
-    """TabM regressor."""
+    """TabM ensemble regressor with an ``mse`` loss by default.
+
+    Member predictions are aggregated into one value per row. See
+    :class:`TabMBase` for parameters.
+
+    Examples
+    --------
+    >>> from scikit_rank import TabMRegressor
+    >>> regressor = TabMRegressor(k=8, epochs=5, num_features=["num"])
+    >>> predictions = regressor.fit(X, y_reg).predict(X)  # doctest: +SKIP
+
+    """
 
     _default_loss = "mse"
 
@@ -504,7 +631,20 @@ class TabMRegressor(RegressorMixin, TabMBase):
 
 
 class TabMRanker(TabMBase):
-    """TabM learning-to-rank estimator."""
+    """TabM learning-to-rank estimator.
+
+    The default ``lambdarank`` loss, and other group-aware losses, require one
+    query id per row through ``fit(X, y, group=...)``. Ranking batches preserve
+    complete queries and :meth:`predict` returns scores where larger is better.
+    See :class:`TabMBase` for parameters.
+
+    Examples
+    --------
+    >>> from scikit_rank import TabMRanker
+    >>> ranker = TabMRanker(k=8, loss="listwise", epochs=5)
+    >>> scores = ranker.fit(df, y="click", group="impression_id").predict(df)  # doctest: +SKIP
+
+    """
 
     _default_loss = "lambdarank"
 

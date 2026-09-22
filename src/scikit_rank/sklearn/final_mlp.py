@@ -44,7 +44,85 @@ if TYPE_CHECKING:
 
 
 class FinalMLPBase(BaseEstimator):
-    """Shared FinalMLP architecture parameters over the common estimator pipeline."""
+    """Shared fit/predict machinery for the FinalMLP estimators.
+
+    Do not instantiate this class directly. Use :class:`FinalMLPClassifier`,
+    :class:`FinalMLPRegressor`, or :class:`FinalMLPRanker`. The estimators expose
+    explicit constructor parameters and support sklearn ``clone``,
+    ``get_params``/``set_params``, and ``GridSearchCV``.
+
+    Parameters
+    ----------
+    embedding_dim : int or None, default=10
+        Width of categorical embeddings and feature-selection context vectors.
+    mlp1_hidden_units, mlp2_hidden_units : sequence of int, default=(64, 64, 64)
+        Hidden-layer widths of the two FinalMLP towers.
+    mlp1_hidden_activations, mlp2_hidden_activations : str, default="relu"
+        Activation applied to every hidden layer in the corresponding tower.
+    mlp1_dropout, mlp2_dropout : float, default=0.0
+        Dropout probability for the corresponding tower.
+    mlp1_batch_norm, mlp2_batch_norm : bool, default=False
+        Apply batch normalization in the corresponding tower.
+    use_fs : bool, default=True
+        Enable FinalMLP's two feature-selection gates.
+    fs_hidden_units : sequence of int, default=(64,)
+        Hidden-layer widths of the feature-selection networks.
+    fs1_context, fs2_context : sequence of str, default=()
+        Feature names used as context by each feature-selection gate. An empty
+        sequence uses the learned context bias from the reference architecture.
+    num_heads : int, default=1
+        Number of heads in the bilinear fusion module.
+    num_encoder, cat_encoder : str or torch.nn.Module
+        Numeric and categorical encoder specifications. ``num_encoder="ple"``
+        enables piecewise-linear numeric encoding.
+    loss : str or Loss or None, default=None
+        Loss specification or instance. ``None`` selects ``bce`` for binary
+        classification, ``mse`` for regression, and ``lambdarank`` for ranking.
+    lr, weight_decay, optimizer, optimizer_kwargs
+        Optimizer configuration. ``optimizer`` defaults to ``"adamw"``.
+    epochs : int, default=10
+        Maximum training epochs.
+    batch_size : int, default=1024
+        Mini-batch size. Ranking batches preserve query boundaries.
+    early_stopping_rounds, eval_metric, eval_metric_name,
+    eval_metric_direction, eval_metric_group_aware
+        Validation and early-stopping configuration. Pass ``eval_set`` to
+        :meth:`fit` when early stopping is enabled.
+    num_features, cat_features : sequence of str or None, default=None
+        Explicit feature columns. ``None`` infers columns from input dtypes.
+    multihash_features, multihash_encoder
+        High-cardinality columns and their shared hashed encoder.
+    embedding_features, embedding_encoders
+        Named columns containing external embedding vectors and their encoders.
+    normalize_numeric, n_quantiles, numeric_nan_fill, ple_n_bins
+        Numeric preprocessing and PLE-bin configuration.
+    lr_scheduler, grad_clip_norm, embedding_regularizer, ema_decay
+        Optional scheduler, optimization, and weight-averaging controls.
+    chunk_rows : int, default=100_000
+        Streaming chunk size for lazy training and inference.
+    random_state : int or None, default=None
+        Torch and NumPy random seed.
+    accelerator_config : dict or None, default=None
+        Keyword arguments for :class:`accelerate.Accelerator`.
+    verbose : bool, default=False
+        Print training progress and epoch logs.
+
+    Attributes
+    ----------
+    model_ : torch.nn.Module
+        Fitted FinalMLP network, retained on CPU for stable pickling.
+    loss_ : Loss
+        Instantiated training loss.
+    history_ : list[dict[str, float]]
+        Per-epoch train and validation metrics.
+    preprocessor_ : TabularPreprocessor
+        Fitted feature preprocessor.
+    n_features_in_ : int
+        Number of fitted input features.
+    feature_names_in_ : numpy.ndarray
+        Input feature names in preprocessing order.
+
+    """
 
     def __init__(  # noqa: PLR0913 -- sklearn requires explicit flat hyperparameters
         self,
@@ -229,7 +307,32 @@ class FinalMLPBase(BaseEstimator):
         eval_set: EvalSet | None = None,
         **kwargs: Any,
     ) -> Self:
-        """Fit the estimator on tabular features and a task-specific target."""
+        """Fit the estimator on ``X`` and ``y``.
+
+        Parameters
+        ----------
+        X : numpy.ndarray, pandas.DataFrame, polars.DataFrame, or polars.LazyFrame
+            Training features. String categoricals and NaNs are handled natively.
+            With a lazy frame, the data is preprocessed and streamed through a
+            temporary Arrow IPC file.
+        y : array-like or str, default=None
+            Target values, or a target-column name when ``X`` is a polars frame.
+        group : array-like or str or None, default=None
+            Per-row query ids for ranking losses. With a lazy frame, pass the
+            group-column name. Group-aware losses require this argument.
+        eval_set : tuple or None, default=None
+            Validation data as ``(X_val, y_val)`` or ``(X_val, y_val, group_val)``.
+            Required when ``early_stopping_rounds`` is set.
+        **kwargs
+            Unsupported. Passing fit parameters such as ``sample_weight`` raises
+            :class:`TypeError`.
+
+        Returns
+        -------
+        self
+            The fitted estimator.
+
+        """
         if kwargs:
             raise TypeError(
                 f"{type(self).__name__}.fit() got unexpected keyword "
@@ -417,7 +520,21 @@ class FinalMLPBase(BaseEstimator):
 
 
 class FinalMLPClassifier(ClassifierMixin, FinalMLPBase):
-    """Binary FinalMLP classifier."""
+    """FinalMLP binary classifier.
+
+    Targets may be boolean, integer, or string labels. This estimator currently
+    supports exactly two classes and uses ``bce`` by default. Fitted labels are
+    exposed through ``classes_``. See :class:`FinalMLPBase` for parameters.
+
+    Examples
+    --------
+    >>> from scikit_rank import FinalMLPClassifier
+    >>> classifier = FinalMLPClassifier(epochs=5, num_features=["num"])
+    >>> classifier.fit(X, y)  # doctest: +SKIP
+    >>> classifier.predict_proba(X).shape  # doctest: +SKIP
+    (n_samples, 2)
+
+    """
 
     _default_loss = "bce"
 
@@ -489,7 +606,17 @@ class FinalMLPClassifier(ClassifierMixin, FinalMLPBase):
 
 
 class FinalMLPRegressor(RegressorMixin, FinalMLPBase):
-    """FinalMLP regressor."""
+    """FinalMLP regressor with an ``mse`` loss by default.
+
+    See :class:`FinalMLPBase` for parameters.
+
+    Examples
+    --------
+    >>> from scikit_rank import FinalMLPRegressor
+    >>> regressor = FinalMLPRegressor(epochs=5, num_features=["num"])
+    >>> predictions = regressor.fit(X, y_reg).predict(X)  # doctest: +SKIP
+
+    """
 
     _default_loss = "mse"
 
@@ -499,7 +626,20 @@ class FinalMLPRegressor(RegressorMixin, FinalMLPBase):
 
 
 class FinalMLPRanker(FinalMLPBase):
-    """FinalMLP learning-to-rank estimator."""
+    """FinalMLP learning-to-rank estimator.
+
+    The default ``lambdarank`` loss, and other group-aware losses, require one
+    query id per row through ``fit(X, y, group=...)``. Ranking batches preserve
+    complete queries and :meth:`predict` returns scores where larger is better.
+    See :class:`FinalMLPBase` for parameters.
+
+    Examples
+    --------
+    >>> from scikit_rank import FinalMLPRanker
+    >>> ranker = FinalMLPRanker(loss="listwise", epochs=5)
+    >>> scores = ranker.fit(df, y="click", group="impression_id").predict(df)  # doctest: +SKIP
+
+    """
 
     _default_loss = "lambdarank"
 

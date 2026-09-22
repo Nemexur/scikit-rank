@@ -45,7 +45,96 @@ if TYPE_CHECKING:
 
 
 class DESTINEBase(BaseEstimator):
-    """Shared DESTINE architecture parameters over the common estimator pipeline."""
+    """Shared fit/predict machinery for the DESTINE estimators.
+
+    Do not instantiate this class directly. Use :class:`DESTINEClassifier`,
+    :class:`DESTINERegressor`, or :class:`DESTINERanker`. The explicit constructor
+    parameters work with sklearn ``clone``, ``get_params``/``set_params``, and
+    ``GridSearchCV``.
+
+    Parameters
+    ----------
+    embedding_dim : int, default=16
+        Common width of categorical embeddings and projected numeric fields.
+    attention_dim : int, default=16
+        Width of the disentangled-attention query and key projections.
+    num_heads : int, default=2
+        Number of attention heads.
+    attention_layers : int, default=2
+        Number of stacked disentangled-attention layers.
+    dnn_hidden_units : sequence of int, default=()
+        Hidden widths for the optional deep branch. An empty sequence selects
+        attention-only DESTINE; non-empty units create the DESTINE+ branch.
+    net_dropout, attention_dropout : float, default=0.0
+        Dropout probabilities for the deep and attention branches.
+    activation : str, default="relu"
+        Activation used by the optional deep branch.
+    batch_norm : bool, default=False
+        Apply batch normalization in the optional deep branch.
+    relu_before_attention : bool, default=False
+        Apply ReLU to input fields before attention.
+    scale_attention : bool, default=True
+        Scale pairwise attention scores by the attention dimension.
+    unary_mode : {"paper", "static"}, default="paper"
+        Unary-attention formulation. ``"paper"`` follows the paper; ``"static"``
+        is the FuxiCTR-compatible key-only scorer.
+    residual_mode : {"each_layer", "last_layer", "none"} or None,
+        default="each_layer"
+        Attention residual-connection strategy.
+    attention_activation : bool, default=True
+        Apply an activation after the attention projection.
+    use_wide : bool, default=False
+        Add a linear wide component over raw features.
+    cat_encoder : str or torch.nn.Module, default="per_feature"
+        Categorical encoder specification.
+    loss : str or Loss or None, default=None
+        Loss specification or instance. ``None`` selects the task default:
+        ``bce``/``cross_entropy``, ``mse``, or ``lambdarank``.
+    lr, weight_decay, optimizer, optimizer_kwargs
+        Optimizer configuration. DESTINE defaults to ``optimizer="adam"``.
+    epochs : int, default=10
+        Maximum training epochs.
+    batch_size : int, default=1024
+        Mini-batch size. Ranking batches preserve query boundaries.
+    early_stopping_rounds, eval_metric, eval_metric_name,
+    eval_metric_direction, eval_metric_group_aware
+        Validation and early-stopping configuration. Early stopping requires an
+        ``eval_set`` passed to :meth:`fit`.
+    num_features, cat_features : sequence of str or None, default=None
+        Explicit feature columns. ``None`` infers columns from input dtypes.
+    multihash_features, multihash_encoder
+        High-cardinality columns and their shared hashed encoder.
+    embedding_features, embedding_encoders
+        Named columns containing external embedding vectors and their encoders.
+    normalize_numeric, n_quantiles, numeric_nan_fill
+        Numeric preprocessing configuration.
+    lr_scheduler, grad_clip_norm, embedding_regularizer, ema_decay
+        Optional scheduler, optimization, and weight-averaging controls.
+    chunk_rows : int, default=100_000
+        Streaming chunk size for lazy training and inference.
+    random_state : int or None, default=None
+        Torch and NumPy random seed.
+    accelerator_config : dict or None, default=None
+        Keyword arguments for :class:`accelerate.Accelerator`.
+    verbose : bool, default=False
+        Print training progress and epoch logs.
+
+    Attributes
+    ----------
+    model_ : torch.nn.Module
+        Fitted DESTINE network, retained on CPU for stable pickling.
+    loss_ : Loss
+        Instantiated training loss.
+    history_ : list[dict[str, float]]
+        Per-epoch train and validation metrics.
+    preprocessor_ : TabularPreprocessor
+        Fitted feature preprocessor.
+    n_features_in_ : int
+        Number of fitted input features.
+    feature_names_in_ : numpy.ndarray
+        Input feature names in preprocessing order.
+
+    """
 
     def __init__(  # noqa: PLR0913 -- sklearn requires explicit constructor parameters
         self,
@@ -221,7 +310,32 @@ class DESTINEBase(BaseEstimator):
         eval_set: EvalSet | None = None,
         **kwargs: Any,
     ) -> Self:
-        """Fit the estimator on tabular features and a task-specific target."""
+        """Fit the estimator on ``X`` and ``y``.
+
+        Parameters
+        ----------
+        X : numpy.ndarray, pandas.DataFrame, polars.DataFrame, or polars.LazyFrame
+            Training features. String categoricals and NaNs are handled natively.
+            With a lazy frame, the data is preprocessed and streamed through a
+            temporary Arrow IPC file.
+        y : array-like or str, default=None
+            Target values, or a target-column name when ``X`` is a polars frame.
+        group : array-like or str or None, default=None
+            Per-row query ids for ranking losses. With a lazy frame, pass the
+            group-column name. Group-aware losses require this argument.
+        eval_set : tuple or None, default=None
+            Validation data as ``(X_val, y_val)`` or ``(X_val, y_val, group_val)``.
+            Required when ``early_stopping_rounds`` is set.
+        **kwargs
+            Unsupported. Passing fit parameters such as ``sample_weight`` raises
+            :class:`TypeError`.
+
+        Returns
+        -------
+        self
+            The fitted estimator.
+
+        """
         if kwargs:
             raise TypeError(
                 f"{type(self).__name__}.fit() got unexpected keyword "
@@ -393,7 +507,21 @@ class DESTINEBase(BaseEstimator):
 
 
 class DESTINEClassifier(ClassifierMixin, DESTINEBase):
-    """DESTINE classifier for binary and multiclass targets."""
+    """DESTINE classifier for binary, multiclass, and ordinal targets.
+
+    Binary targets use ``bce`` and multiclass targets use ``cross_entropy`` by
+    default. ``loss="coral_layer"`` enables an ordinal output head. Fitted labels
+    are stored in ``classes_``. See :class:`DESTINEBase` for parameters.
+
+    Examples
+    --------
+    >>> from scikit_rank import DESTINEClassifier
+    >>> classifier = DESTINEClassifier(epochs=5, num_features=["num"])
+    >>> classifier.fit(X, y)  # doctest: +SKIP
+    >>> classifier.predict_proba(X).shape  # doctest: +SKIP
+    (n_samples, n_classes)
+
+    """
 
     _default_loss = "bce"
 
@@ -465,7 +593,17 @@ class DESTINEClassifier(ClassifierMixin, DESTINEBase):
 
 
 class DESTINERegressor(RegressorMixin, DESTINEBase):
-    """DESTINE regressor."""
+    """DESTINE regressor with an ``mse`` loss by default.
+
+    See :class:`DESTINEBase` for parameters.
+
+    Examples
+    --------
+    >>> from scikit_rank import DESTINERegressor
+    >>> regressor = DESTINERegressor(epochs=5, num_features=["num"])
+    >>> predictions = regressor.fit(X, y_reg).predict(X)  # doctest: +SKIP
+
+    """
 
     _default_loss = "mse"
 
@@ -475,7 +613,20 @@ class DESTINERegressor(RegressorMixin, DESTINEBase):
 
 
 class DESTINERanker(DESTINEBase):
-    """DESTINE learning-to-rank estimator."""
+    """DESTINE learning-to-rank estimator.
+
+    The default ``lambdarank`` loss, and other group-aware losses, require one
+    query id per row through ``fit(X, y, group=...)``. Ranking batches preserve
+    complete queries and :meth:`predict` returns scores where larger is better.
+    See :class:`DESTINEBase` for parameters.
+
+    Examples
+    --------
+    >>> from scikit_rank import DESTINERanker
+    >>> ranker = DESTINERanker(loss="listwise", epochs=5)
+    >>> scores = ranker.fit(df, y="click", group="impression_id").predict(df)  # doctest: +SKIP
+
+    """
 
     _default_loss = "lambdarank"
 
