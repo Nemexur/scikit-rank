@@ -286,26 +286,30 @@ class DCNAdapter(ModelAdapter):
     """
 
     name = "dcn"
+    estimator_class = "DCNClassifier"
+    model_label = "DCNv2"
 
     def run(self, cfg, train_lazy, x_val, y_val, x_test, *,
             label, num_features, cat_features, params, seed, verbose):
         import torch  # noqa: PLC0415 - lazy per-model import
 
-        from scikit_rank import DCNClassifier  # noqa: PLC0415 - lazy per-model import
+        import scikit_rank  # noqa: PLC0415 - lazy per-model import
 
         self._seed_torch(torch, seed, deterministic=bool(cfg.get("deterministic", False)))
         est_kwargs = self._build_estimator_kwargs(
             params, num_features, cat_features, verbose=verbose,
         )
         logger.info(
-            "Training DCNv2 (%s epoch(s), streaming lazy train)...", est_kwargs.get("epochs", 10),
+            "Training %s (%s epoch(s), streaming lazy train)...",
+            self.model_label,
+            est_kwargs.get("epochs", 10),
         )
-        estimator = DCNClassifier(**est_kwargs)
+        estimator = getattr(scikit_rank, self.estimator_class)(**est_kwargs)
         estimator.fit(train_lazy, y=label, eval_set=(x_val, y_val))
 
         history = list(estimator.history_)
         best_iter = len(history)  # DCN has no boosting rounds; report epochs trained.
-        logger.info("Trained DCNv2 (%d epoch(s))", best_iter)
+        logger.info("Trained %s (%d epoch(s))", self.model_label, best_iter)
         return (
             history,
             self._predict_proba(estimator, x_val),
@@ -333,7 +337,7 @@ class DCNAdapter(ModelAdapter):
     def _build_estimator_kwargs(
         params: dict[str, Any], num_features: list[str], cat_features: list[str], *, verbose: bool,
     ) -> dict[str, Any]:
-        """Map ``model_params`` onto ``DCNClassifier`` kwargs.
+        """Map ``model_params`` onto a scikit-rank classifier's kwargs.
 
         ``eval_metric: auc`` -> ``roc_auc_score`` (+ name/direction); multihash cols are
         subtracted from the feature lists before injecting them. Everything else is native.
@@ -350,9 +354,45 @@ class DCNAdapter(ModelAdapter):
         return kwargs
 
 
+class DESTINEAdapter(DCNAdapter):
+    """DESTINE through the common streaming estimator pipeline."""
+
+    name = "destine"
+    estimator_class = "DESTINEClassifier"
+    model_label = "DESTINE"
+
+
+class FinalMLPAdapter(DCNAdapter):
+    """FinalMLP through the same raw-data and streaming estimator pipeline."""
+
+    name = "final_mlp"
+    estimator_class = "FinalMLPClassifier"
+    model_label = "FinalMLP"
+
+
+class FinalNetAdapter(DCNAdapter):
+    """FinalNet through the same raw-data and streaming estimator pipeline."""
+
+    name = "finalnet"
+    estimator_class = "FinalNetClassifier"
+    model_label = "FinalNet"
+
+
+class TabMAdapter(DCNAdapter):
+    """TabM through the same raw-data and streaming estimator pipeline."""
+
+    name = "tabm"
+    estimator_class = "TabMClassifier"
+    model_label = "TabM"
+
+
 ADAPTERS: dict[str, ModelAdapter] = {
     "lgbm": LGBMAdapter(),
     "catboost": CatBoostAdapter(),
     "xgboost": XGBoostAdapter(),
     "dcn": DCNAdapter(),
+    "final_mlp": FinalMLPAdapter(),
+    "finalnet": FinalNetAdapter(),
+    "destine": DESTINEAdapter(),
+    "tabm": TabMAdapter(),
 }

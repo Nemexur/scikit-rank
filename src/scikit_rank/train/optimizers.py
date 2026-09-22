@@ -111,6 +111,17 @@ def _build_adamw(model: torch.nn.Module, cfg: OptimizerConfig) -> torch.optim.Op
     )
 
 
+def _build_adam(model: torch.nn.Module, cfg: OptimizerConfig) -> torch.optim.Optimizer:
+    """Build coupled-L2 Adam as used by the original DESTINE experiments."""
+    return torch.optim.Adam(
+        _split_param_groups(model, cfg.weight_decay),
+        lr=cfg.lr,
+        betas=(cfg.adam_beta1, cfg.adam_beta2),
+        eps=cfg.adam_eps,
+        amsgrad=cfg.amsgrad,
+    )
+
+
 def _build_schedulefree_adamw(
     model: torch.nn.Module,
     cfg: OptimizerConfig,
@@ -222,6 +233,7 @@ _OPTIMIZER_BUILDERS: dict[
     str,
     Callable[[torch.nn.Module, OptimizerConfig], torch.optim.Optimizer],
 ] = {
+    "adam": _build_adam,
     "adamw": _build_adamw,
     "adamw_amsgrad": _build_adamw,
     "muon": _build_muon,

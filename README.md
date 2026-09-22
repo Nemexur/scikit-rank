@@ -1,22 +1,38 @@
 # scikit-rank
 
-**sklearn-compatible DCNv2 estimators for tabular ranking, classification, and regression.**
+**sklearn-compatible neural estimators for tabular ranking, classification, and regression.**
 
 `scikit-rank` provides neural, drop-in alternatives to LightGBM / CatBoost / XGBoost
-for tabular problems. The core model is a [DCNv2](https://arxiv.org/abs/2008.13535)
-(Deep & Cross Network v2) wrapped in three scikit-learn estimators with a familiar
-`fit` / `predict` / `predict_proba` API, so they slot straight into existing sklearn
-pipelines, `GridSearchCV`, `clone`, and `get_params` / `set_params`.
+for tabular problems. Its model zoo pairs modern tabular backbones with a consistent
+scikit-learn `fit` / `predict` / `predict_proba` API, so estimators work in existing
+sklearn pipelines and with `GridSearchCV`, `clone`, `get_params`, and `set_params`.
 
 ```python
-from scikit_rank import DCNClassifier, DCNRegressor, DCNRanker
+from scikit_rank import DCNClassifier, FinalNetClassifier, TabMClassifier
 ```
+
+## Model zoo
+
+Every backbone has classifier, regressor, and learning-to-rank estimator variants.
+Classifiers expose `predict_proba`; rankers train and score by query when used with a
+group-aware loss. All estimators accept the common feature, training, evaluation, and
+runtime options described below.
+
+| Backbone | sklearn estimators | Architecture options |
+|---|---|---|
+| [DCNv2](https://arxiv.org/abs/2008.13535) | `DCNClassifier`, `DCNRegressor`, `DCNRanker` | `hidden_units`, `cross_layers`, `cross_rank`, `structure`, `cross_type` |
+| FinalNet | `FinalNetClassifier`, `FinalNetRegressor`, `FinalNetRanker` | `block_type`, `block1_hidden_units`, `block2_hidden_units`, `use_field_gate`, `use_2b_consistency_loss` |
+| FinalMLP | `FinalMLPClassifier`, `FinalMLPRegressor`, `FinalMLPRanker` | `mlp1_hidden_units`, `mlp2_hidden_units`, `use_fs`, `fs_hidden_units`, `fs1_context`, `fs2_context`, `num_heads` |
+| TabM | `TabMClassifier`, `TabMRegressor`, `TabMRanker` | `arch_type`, `n_blocks`, `d_block`, `dropout`, `k`, `start_scaling_init` |
+| [DESTINE](https://arxiv.org/abs/2101.03654) | `DESTINEClassifier`, `DESTINERegressor`, `DESTINERanker` | `embedding_dim`, `attention_dim`, `num_heads`, `attention_layers`, `unary_mode`, `residual_mode`, `use_wide` |
+
+`FinalMLPClassifier` currently supports binary classification only. The other
+classifiers support binary and multiclass targets.
 
 ## Features
 
-- **Three estimators, one backbone.** `DCNClassifier` (binary / multiclass),
-  `DCNRegressor`, and `DCNRanker` (pairwise / listwise learning-to-rank) share the
-  same DCNv2 core and training loop.
+- **Five backbones, one estimator API.** Choose DCNv2, FinalNet, FinalMLP, TabM, or
+  DESTINE without changing the surrounding sklearn workflow.
 - **sklearn-native ergonomics.** Flat `__init__` hyperparameters, `fit(X, y, group=..., eval_set=...)`,
   early stopping, custom eval metrics, and full `get_params` / `set_params` / `clone`
   support — mirroring the LightGBM / XGBoost sklearn wrappers.
@@ -77,12 +93,42 @@ proba = clf.predict_proba(X)   # (n_samples, n_classes)
 labels = clf.predict(X)
 ```
 
+### Choose a backbone
+
+All backbones use the same task-oriented API. Replace the estimator class while
+keeping the `fit` and prediction calls unchanged:
+
+```python
+from scikit_rank import (
+    DESTINEClassifier,
+    FinalMLPClassifier,
+    FinalNetClassifier,
+    TabMClassifier,
+)
+
+models = [
+    FinalNetClassifier(block_type="2B", epochs=10),
+    FinalMLPClassifier(use_fs=True, num_heads=1, epochs=10),
+    TabMClassifier(arch_type="tabm", k=32, epochs=10),
+    DESTINEClassifier(attention_layers=2, num_heads=2, epochs=10),
+]
+
+for model in models:
+    model.fit(X, y)
+    probabilities = model.predict_proba(X)
+```
+
 ### Regression
 
 ```python
-from scikit_rank import DCNRegressor
+from scikit_rank import FinalNetRegressor
 
-reg = DCNRegressor(epochs=10, num_features=["num"], cat_features=["cat"]).fit(X, y_reg)
+reg = FinalNetRegressor(
+    block_type="2B",
+    epochs=10,
+    num_features=["num"],
+    cat_features=["cat"],
+).fit(X, y_reg)
 pred = reg.predict(X)
 ```
 
@@ -92,12 +138,13 @@ Pass a `group` (query / impression id) so the loss and metrics are computed per 
 `group` can be an array or, for (Lazy)Frames, a column name.
 
 ```python
-from scikit_rank import DCNRanker
+from scikit_rank import TabMRanker
 
-ranker = DCNRanker(
+ranker = TabMRanker(
     loss="listwise",
-    hidden_units=[256, 128],
-    cross_layers=3,
+    n_blocks=3,
+    d_block=256,
+    k=32,
     epochs=10,
     num_features=["num"],
     cat_features=["cat"],
@@ -152,7 +199,7 @@ uv run jupyter lab demo.ipynb
 
 | Group | Parameters |
 |---|---|
-| Architecture | `hidden_units`, `cross_layers`, `cross_rank`, `structure` (`stacked`/`parallel`), `cross_type`, `use_moe`, `use_inner_cross_layers` |
+| Backbone architecture | Use the model-specific options in the [model zoo](#model-zoo), e.g. DCNv2 `cross_layers`, FinalNet `block_type`, FinalMLP `use_fs`, TabM `k`, or DESTINE `attention_layers` |
 | Embeddings / encoders | `embedding_dim`, `cat_encoder`, `num_encoder`, `multihash_features`, `embedding_features`, `normalize_numeric`, `ple_n_bins` |
 | Optimization | `loss`, `lr`, `weight_decay`, `optimizer`, `epochs`, `batch_size`, `lr_scheduler`, `grad_clip_norm`, `embedding_regularizer`, `ema_decay` |
 | Evaluation | `eval_metric`, `eval_metric_name`, `eval_metric_direction`, `eval_metric_group_aware`, `early_stopping_rounds` |

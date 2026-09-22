@@ -32,7 +32,8 @@ from scikit_rank.factories import (
     build_lr_scheduler_config,
     multihash_encoder_config,
 )
-from scikit_rank.modules.losses import LOSSES, CORALLayerLoss, Loss, make_loss
+from scikit_rank.modules.finalnet import FinalNetConsistencyLoss
+from scikit_rank.modules.losses import LOSSES, BCELoss, CORALLayerLoss, Loss, make_loss
 from scikit_rank.preprocessing import TabularPreprocessor
 from scikit_rank.run import TrainingRun
 from scikit_rank.sklearn._classification import ClassificationTarget, class_probabilities
@@ -51,7 +52,7 @@ if TYPE_CHECKING:
 
 
 class FinalNetBase(BaseEstimator):
-    """Shared fit/predict machinery for the DCNv2 estimators.
+    """Shared fit/predict machinery for the FinalNet estimators.
 
     Not used directly -- instantiate :class:`FinalNetClassifier`,
     :class:`FinalNetRegressor`, or :class:`FinalNetRanker`. This base holds every
@@ -64,45 +65,42 @@ class FinalNetBase(BaseEstimator):
 
     Parameters
     ----------
-    hidden_units : list[int], default=(256, 128)
-        Layer widths of the deep (MLP) branch.
-    cross_layers : int, default=3
-        Number of DCNv2 feature-crossing layers.
-    cross_rank : int or None, default=None
-        Rank of the low-rank factorization of each cross weight matrix. ``None``
-        uses the full-rank cross weights.
+    block_type : {"1B", "2B"}, default="2B"
+        Use one factorized-interaction block or two parallel blocks whose
+        logits are averaged.
+    block1_hidden_units : sequence of int, default=(400, 400)
+        Output widths of the first factorized-interaction block.
+    block2_hidden_units : sequence of int or None, default=None
+        Output widths of the second block. ``None`` reuses
+        ``block1_hidden_units``.
+    block1_hidden_activations, block2_hidden_activations : str, sequence, or None
+        Activations applied after batch normalization in each block.
+    block1_dropout, block2_dropout : float or sequence of float
+        Per-layer dropout rates. The second block reuses the first block's
+        rates when ``block2_dropout=None``.
+    batch_norm : bool, default=True
+        Apply batch normalization after each factorized interaction.
+    residual_type : {"sum", "concat"}, default="concat"
+        Composition used inside each factorized-interaction layer.
+    interaction_activation : str or None, default="relu"
+        Activation applied to both halves of the interaction projection.
+        Set to ``None`` for the original FuxiCTR FinalNet behavior.
+    use_field_gate : bool, default=False
+        Apply the FinalNet reference field gate to the first block. All logical
+        feature fields must have the same encoded width.
+    use_2b_consistency_loss : bool, default=False
+        Add the reference two-branch consistency/self-distillation objective.
+        This is supported only by binary :class:`FinalNetClassifier` with
+        ``block_type="2B"`` and BCE loss.
     embedding_dim : int or None, default=None
         Embedding size for every categorical feature. ``None`` picks a per-column
         size with the fast.ai heuristic ``min(32, max(2, round(1.6 * card**0.56)))``.
-    dropout : float, default=0.0
-        Dropout probability applied in the deep branch.
-    structure : {"stacked", "parallel"}, default="stacked"
-        How the cross and deep branches are composed. ``"stacked"`` feeds the
-        cross output into the deep branch; ``"parallel"`` concatenates them.
     num_encoder : str or torch.nn.Module, default="identity"
         Numeric-feature encoder spec, e.g. ``"identity"`` or ``"ple"`` (piecewise
         linear encoding, whose bins are fit from training quantiles). A custom
         ``Module`` is used as-is.
     cat_encoder : str or torch.nn.Module, default="per_feature"
         Categorical-feature encoder spec (e.g. one embedding table per feature).
-    gated_cross : bool, default=False
-        Enable the gated variant of the cross layers.
-    cross_type : str, default="standard"
-        Cross-layer variant selector.
-    mask_ratio : float, default=0.5
-        Masking ratio used by mask-enabled cross variants.
-    activation : str, default="relu"
-        Activation function name for the deep branch.
-    batch_norm : bool, default=False
-        Apply batch normalization in the deep branch.
-    use_moe : bool, default=False
-        Replace the deep branch with a mixture-of-experts block.
-    num_experts : int, default=4
-        Number of experts when ``use_moe=True``.
-    moe_top_k : int, default=2
-        Number of experts routed per row when ``use_moe=True``.
-    use_inner_cross_layers : bool, default=False
-        Enable the inner cross-layer variant.
     loss : str or Loss or None, default=None
         Loss spec string (e.g. ``"bce"``, ``"bpr:sampling=all_pairs"``,
         ``"lambdarank"``, ``"cross_entropy"``, ``"coral_layer"``) or a :class:`Loss`
@@ -181,7 +179,7 @@ class FinalNetBase(BaseEstimator):
     Attributes
     ----------
     model_ : torch.nn.Module
-        The fitted DCNv2 network (kept on CPU for stable pickling).
+        The fitted FinalNet network (kept on CPU for stable pickling).
     loss_ : Loss
         The instantiated loss module.
     history_ : list[dict[str, float]]
@@ -197,6 +195,7 @@ class FinalNetBase(BaseEstimator):
     """
 
     _default_loss = "bce"
+    _supports_2b_consistency_loss = False
 
     def __init__(  # noqa: PLR0913 -- sklearn estimator: every hyperparam is explicit
         self,
@@ -211,6 +210,8 @@ class FinalNetBase(BaseEstimator):
         batch_norm: bool = True,
         residual_type: Literal["sum", "concat"] = "concat",
         interaction_activation: str | None = "relu",
+        use_field_gate: bool = False,
+        use_2b_consistency_loss: bool = False,
         embedding_dim: int | None = None,
         num_encoder: str | torch.nn.Module = "identity",
         cat_encoder: str | torch.nn.Module = "per_feature",
@@ -255,6 +256,8 @@ class FinalNetBase(BaseEstimator):
         self.batch_norm = batch_norm
         self.residual_type = residual_type
         self.interaction_activation = interaction_activation
+        self.use_field_gate = use_field_gate
+        self.use_2b_consistency_loss = use_2b_consistency_loss
         self.embedding_dim = embedding_dim
         self.num_encoder = num_encoder
         self.cat_encoder = cat_encoder
@@ -319,6 +322,18 @@ class FinalNetBase(BaseEstimator):
             )
             loss_fn = make_loss(loss_spec.module_name(), **loss_spec.kwargs())
         return loss_fn
+
+    def _validate_2b_consistency_loss(self, loss_fn: Loss, n_outputs: int) -> None:
+        if not self.use_2b_consistency_loss:
+            return
+        if self.block_type != "2B":
+            raise ValueError("use_2b_consistency_loss=True requires block_type='2B'")
+        if not self._supports_2b_consistency_loss or n_outputs != 1:
+            raise TypeError(
+                "use_2b_consistency_loss=True is supported only for binary FinalNetClassifier",
+            )
+        if not isinstance(loss_fn, BCELoss):
+            raise TypeError("use_2b_consistency_loss=True requires loss='bce'")
 
     def _fit_target_meta(
         self,
@@ -447,6 +462,7 @@ class FinalNetBase(BaseEstimator):
         if isinstance(loss_fn, CORALLayerLoss):
             raise TypeError("loss='coral_layer' is not supported by FinalNet")
         n_outputs = self._resolve_n_outputs()
+        self._validate_2b_consistency_loss(loss_fn, n_outputs)
         embedding_input_dims = self.preprocessor_.embedding_input_dims_
         if self.embedding_encoders and not embedding_input_dims:
             raise ValueError("embedding_encoders requires embedding_features")
@@ -470,6 +486,7 @@ class FinalNetBase(BaseEstimator):
             batch_norm=self.batch_norm,
             residual_type=self.residual_type,
             interaction_activation=self.interaction_activation,
+            use_field_gate=self.use_field_gate,
             num_encoder=self.num_encoder,
             cat_encoder=self.cat_encoder,
             num_encoder_bins=ple_bins,
@@ -478,6 +495,9 @@ class FinalNetBase(BaseEstimator):
             embedding_encoders=embedding_encoders,
             embedding_input_dims=embedding_input_dims or None,
             n_outputs=n_outputs,
+        )
+        training_loss = (
+            FinalNetConsistencyLoss(loss_fn) if self.use_2b_consistency_loss else loss_fn
         )
 
         # data sources; temp Arrow files (lazy path) are cleaned up on exit
@@ -503,7 +523,7 @@ class FinalNetBase(BaseEstimator):
             lr_scheduler_config = build_lr_scheduler_config(self.lr_scheduler)
             train_out = TrainingRun(
                 model,
-                loss_fn,
+                training_loss,
                 train_source,
                 val_source,
                 lr=self.lr,
@@ -529,7 +549,12 @@ class FinalNetBase(BaseEstimator):
 
         # keep fitted modules on CPU: pickling and re-fitting stay trivial
         self.model_ = module.model().cpu()
-        self.loss_ = module.loss_fn().cpu()
+        trained_loss = module.loss_fn()
+        if self.use_2b_consistency_loss:
+            if not isinstance(trained_loss, FinalNetConsistencyLoss):
+                raise TypeError("FinalNet training returned an unexpected loss module")
+            trained_loss = trained_loss.unwrap()
+        self.loss_ = trained_loss.cpu()
         self.history_ = history
         self.n_features_in_ = (
             len(self.preprocessor_.num_cols_)
@@ -582,7 +607,7 @@ class FinalNetBase(BaseEstimator):
 
 
 class FinalNetClassifier(ClassifierMixin, FinalNetBase):
-    """DCNv2 classifier (binary or multiclass).
+    """FinalNet classifier (binary or multiclass).
 
     A scikit-learn ``ClassifierMixin``. Binary problems train a single logit with
     ``bce`` (the default; any pointwise/ordinal loss also works). Multiclass
@@ -612,6 +637,7 @@ class FinalNetClassifier(ClassifierMixin, FinalNetBase):
     """
 
     _default_loss = "bce"
+    _supports_2b_consistency_loss = True
 
     def _fit_target_meta(
         self,
@@ -697,7 +723,7 @@ class FinalNetClassifier(ClassifierMixin, FinalNetBase):
 
 
 class FinalNetRegressor(RegressorMixin, FinalNetBase):
-    """DCNv2 regressor.
+    """FinalNet regressor.
 
     A scikit-learn ``RegressorMixin`` predicting a single continuous target,
     trained with ``mse`` by default. See :class:`FinalNetBase` for the full list of
@@ -728,7 +754,7 @@ class FinalNetRegressor(RegressorMixin, FinalNetBase):
 
 
 class FinalNetRanker(FinalNetBase):
-    """DCNv2 learning-to-rank estimator.
+    """FinalNet learning-to-rank estimator.
 
     Trains a per-row relevance score with a ranking loss (``lambdarank`` by
     default; also ``bpr``, listwise/softmax, etc.). Call

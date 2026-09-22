@@ -25,7 +25,8 @@ def score_tabular_model(
     Estimator families retain responsibility for input validation and task-level
     conversion of logits to predictions. This function owns only the established
     tabular batch protocol: preprocessor output becomes a tensor batch keyed by
-    feature stream name, and the model returns a tensor of logits.
+    feature stream name. Models may return logits directly or as the first item
+    of a tuple carrying additional training outputs.
     """
     device = _inference_device(accelerator_config)
     model.to(device).eval()
@@ -84,5 +85,7 @@ def _score_frame(
         batch.update(
             {name: torch.from_numpy(arr[start:stop]).to(device) for name, arr in extra.items()},
         )
-        outputs.append(model(batch).float().cpu().numpy())
+        model_output = model(batch)
+        logits = model_output[0] if isinstance(model_output, tuple) else model_output
+        outputs.append(logits.float().cpu().numpy())
     return np.concatenate(outputs, axis=0) if outputs else np.zeros((0,), dtype=np.float32)

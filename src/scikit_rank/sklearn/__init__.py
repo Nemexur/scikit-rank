@@ -1,18 +1,4 @@
-"""sklearn-compatible estimators for scikit_rank.
-
-Public API:
-
-- :class:`DCNClassifier`
-- :class:`DCNRegressor`
-- :class:`DCNRanker`
-- :class:`DCNBase` (shared base class for custom estimators)
-- :class:`FinalNetClassifier`
-- :class:`FinalNetRegressor`
-- :class:`FinalNetRanker`
-- :class:`FinalNetBase` (shared base class for custom estimators)
-
-Input-validation helpers live in :mod:`scikit_rank.sklearn.input_validation`.
-"""
+"""sklearn-compatible estimators for scikit_rank."""
 
 from scikit_rank.sklearn.dcn import (
     DCNBase,
@@ -20,11 +6,29 @@ from scikit_rank.sklearn.dcn import (
     DCNRanker,
     DCNRegressor,
 )
+from scikit_rank.sklearn.destine import (
+    DESTINEBase,
+    DESTINEClassifier,
+    DESTINERanker,
+    DESTINERegressor,
+)
+from scikit_rank.sklearn.final_mlp import (
+    FinalMLPBase,
+    FinalMLPClassifier,
+    FinalMLPRanker,
+    FinalMLPRegressor,
+)
 from scikit_rank.sklearn.finalnet import (
     FinalNetBase,
     FinalNetClassifier,
     FinalNetRanker,
     FinalNetRegressor,
+)
+from scikit_rank.sklearn.tabm import (
+    TabMBase,
+    TabMClassifier,
+    TabMRanker,
+    TabMRegressor,
 )
 
 __all__ = [
@@ -32,8 +36,20 @@ __all__ = [
     "DCNClassifier",
     "DCNRanker",
     "DCNRegressor",
+    "DESTINEBase",
+    "DESTINEClassifier",
+    "DESTINERanker",
+    "DESTINERegressor",
+    "FinalMLPBase",
+    "FinalMLPClassifier",
+    "FinalMLPRanker",
+    "FinalMLPRegressor",
     "FinalNetBase",
     "FinalNetClassifier",
     "FinalNetRanker",
     "FinalNetRegressor",
+    "TabMBase",
+    "TabMClassifier",
+    "TabMRanker",
+    "TabMRegressor",
 ]
