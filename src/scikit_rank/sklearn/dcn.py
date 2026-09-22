@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     from sklearn.utils import Tags
 
     from scikit_rank.sklearn._types import EvalSet, GroupLike, XLike, YLike
+    from scikit_rank.train.options import TrainingOptions
 
 
 class DCNBase(BaseEstimator):
@@ -244,6 +245,7 @@ class DCNBase(BaseEstimator):
         chunk_rows: int = 100_000,
         random_state: int | None = None,
         accelerator_config: dict[str, Any] | None = None,
+        training_options: TrainingOptions | None = None,
         verbose: bool = False,
     ) -> None:
         self.hidden_units = hidden_units
@@ -290,6 +292,7 @@ class DCNBase(BaseEstimator):
         self.embedding_regularizer = embedding_regularizer
         self.ema_decay = ema_decay
         self.accelerator_config = accelerator_config
+        self.training_options = training_options
         self.chunk_rows = chunk_rows
         self.random_state = random_state
         self.verbose = verbose
@@ -527,6 +530,7 @@ class DCNBase(BaseEstimator):
                 ),
                 epochs=self.epochs,
                 accelerator_config=self.accelerator_config,
+                training_options=self.training_options,
                 early_stopping_rounds=self.early_stopping_rounds,
                 verbose=self.verbose,
                 eval_metric_fn=self.eval_metric,

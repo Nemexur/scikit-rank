@@ -1,6 +1,6 @@
 from __future__ import annotations
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -18,6 +18,10 @@ if TYPE_CHECKING:
     from torch.optim.lr_scheduler import ReduceLROnPlateau
 
     from scikit_rank.train.trainer import Trainer
+
+
+type TrainingOption = Callable[["Trainer", "Accelerator"], None]
+type TrainingOptions = Sequence[TrainingOption]
 
 
 logger = logging.getLogger(__name__)
