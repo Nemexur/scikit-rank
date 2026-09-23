@@ -21,9 +21,9 @@ runtime options described below.
 | Backbone | sklearn estimators | Architecture options |
 |---|---|---|
 | [DCNv2](https://arxiv.org/abs/2008.13535) | `DCNClassifier`, `DCNRegressor`, `DCNRanker` | `hidden_units`, `cross_layers`, `cross_rank`, `structure`, `cross_type` |
-| FinalNet | `FinalNetClassifier`, `FinalNetRegressor`, `FinalNetRanker` | `block_type`, `block1_hidden_units`, `block2_hidden_units`, `use_field_gate`, `use_2b_consistency_loss` |
-| FinalMLP | `FinalMLPClassifier`, `FinalMLPRegressor`, `FinalMLPRanker` | `mlp1_hidden_units`, `mlp2_hidden_units`, `use_fs`, `fs_hidden_units`, `fs1_context`, `fs2_context`, `num_heads` |
-| TabM | `TabMClassifier`, `TabMRegressor`, `TabMRanker` | `arch_type`, `n_blocks`, `d_block`, `dropout`, `k`, `start_scaling_init` |
+| [FinalNet](https://dl.acm.org/doi/epdf/10.1145/3539618.3591988) | `FinalNetClassifier`, `FinalNetRegressor`, `FinalNetRanker` | `block_type`, `block1_hidden_units`, `block2_hidden_units`, `use_field_gate`, `use_2b_consistency_loss` |
+| [FinalMLP](https://arxiv.org/abs/2304.00902) | `FinalMLPClassifier`, `FinalMLPRegressor`, `FinalMLPRanker` | `mlp1_hidden_units`, `mlp2_hidden_units`, `use_fs`, `fs_hidden_units`, `fs1_context`, `fs2_context`, `num_heads` |
+| [TabM](https://arxiv.org/pdf/2410.24210) | `TabMClassifier`, `TabMRegressor`, `TabMRanker` | `arch_type`, `n_blocks`, `d_block`, `dropout`, `k`, `start_scaling_init` |
 | [DESTINE](https://arxiv.org/abs/2101.03654) | `DESTINEClassifier`, `DESTINERegressor`, `DESTINERanker` | `embedding_dim`, `attention_dim`, `num_heads`, `attention_layers`, `unary_mode`, `residual_mode`, `use_wide` |
 
 `FinalMLPClassifier` currently supports binary classification only. The other
